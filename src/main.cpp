@@ -61,6 +61,10 @@ static float g_specStr      = 1.366f;
 static float g_camDist      = 1.267f;   // fraction of GRID
 static float g_camHeight    = 0.575f;   // fraction of GRID
 static float g_camSpeed     = 0.0f;
+static float g_camAngle     = 0.0f;     // manual orbit angle (radians)
+static bool  g_rDragging    = false;    // right-click drag active
+static float g_rDragStartX  = 0.0f;    // mouse X at right-click start
+static float g_rDragStartAngle = 0.0f; // camAngle at right-click start
 
 // Ball interaction
 static float g_ballRadius   = 15.62f;
@@ -532,75 +536,8 @@ static bool mouseToWaterPlane(float mx, float my, float& outX, float& outZ) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Apply ball interaction — waterline impulse injection.
-// Only injects height when the ball is moving. The impulse is applied at a
-// ring near the ball radius (the waterline), positive ahead and negative
-// behind the movement direction. The wave equation naturally disperses
-// this into a Kelvin-like V-wake. No persistent depression — that would
-// create a standing wave artifact.
-// Reference: Yuksel et al. "Wave Particles", NVIDIA interactive water demos.
-// ---------------------------------------------------------------------------
-static void applyBall() {
-    if (!g_dragging) return;
-
-    float dvx = g_ballX - g_ballPrevX;
-    float dvz = g_ballZ - g_ballPrevZ;
-    float speed = sqrtf(dvx * dvx + dvz * dvz);
-    if (speed < 0.1f) return;  // no wake when stationary
-
-    float mdx = dvx / speed;
-    float mdz = dvz / speed;
-
-    // Interpolate along path for continuous wake at any drag speed
-    int numSteps = std::max(1, static_cast<int>(speed / (g_ballRadius * 0.4f)) + 1);
-    float invSteps = 1.0f / static_cast<float>(numSteps);
-    int r = static_cast<int>(g_ballRadius * 1.2f) + 1;
-    float R = g_ballRadius;
-
-    for (int step = 0; step <= numSteps; step++) {
-        float st = static_cast<float>(step) * invSteps;
-        float bcx = g_ballPrevX + dvx * st + GRID * 0.5f;
-        float bcz = g_ballPrevZ + dvz * st + GRID * 0.5f;
-        int cx = static_cast<int>(bcx);
-        int cz = static_cast<int>(bcz);
-
-        for (int dz = -r; dz <= r; dz++) {
-            for (int dx = -r; dx <= r; dx++) {
-                int gx = cx + dx;
-                int gz = cz + dz;
-                if (gx < 0 || gx >= GRID || gz < 0 || gz >= GRID) continue;
-
-                float fx = gx - bcx;
-                float fz = gz - bcz;
-                float dist2 = fx * fx + fz * fz;
-                if (dist2 > R * R * 1.5f || dist2 < 1.0f) continue;
-
-                float dist = sqrtf(dist2);
-                float tn = dist / R;
-
-                // Gaussian ring profile peaked at ~0.8*radius (the waterline)
-                float ring = expf(-((tn - 0.8f) * (tn - 0.8f)) / 0.12f);
-
-                // Dot with movement direction: >0 ahead, <0 behind
-                float nx = fx / dist;
-                float nz = fz / dist;
-                float facing = nx * mdx + nz * mdz;
-
-                // Height impulse: bow wave (up ahead) + trough (down behind)
-                float impulse = facing * ring * g_ballMovePush * speed * invSteps;
-
-                int idx = gz * GRID + gx;
-                g_state[idx] = ov::float16(float(g_state[idx]) + impulse);
-            }
-        }
-    }
-
-    // Update prev position at tick time (not in mouse handler)
-    // so speed captures total displacement since last tick
-    g_ballPrevX = g_ballX;
-    g_ballPrevZ = g_ballZ;
-}
+// Ball splash is now computed on NPU — see ball wake section in generate_model.py
+// CPU packs ball_in = (x, z, vx, vz, radius, push) in runSimulation()
 
 // ---------------------------------------------------------------------------
 // Initialize D3D11
@@ -1025,32 +962,45 @@ static void runSimulation() {
     // Input 2: camera position [1, 3, 1, 1] — for view-dependent refraction
     auto cameraTensor = g_infer.get_input_tensor(2);
     auto* camData = cameraTensor.data<ov::float16>();
-    float camAngle = g_time * g_camSpeed;
+    float camAngle = g_time * g_camSpeed + g_camAngle;
     float camDist  = GRID * g_camDist;
     float camH     = GRID * g_camHeight;
     camData[0] = ov::float16(cosf(camAngle) * camDist);  // eye_x
     camData[1] = ov::float16(camH);                       // eye_y
     camData[2] = ov::float16(sinf(camAngle) * camDist);  // eye_z
 
-    // Input 3: duck state [1, 6, 1, 1] = (x, z, vx, vz, slope_x, slope_z)
-    // CPU samples slope at duck position from previous frame's render output
+    // Input 3: duck state [1, 4, 1, 1] = (x, z, vx, vz)
+    // Slope sampling and wall bounce both computed on NPU
     auto duckTensor = g_infer.get_input_tensor(3);
     auto* duckIn = duckTensor.data<ov::float16>();
-    int dgx = std::max(1, std::min(GRID - 2, static_cast<int>(g_duckX + GRID * 0.5f)));
-    int dgz = std::max(1, std::min(GRID - 2, static_cast<int>(g_duckZ + GRID * 0.5f)));
-    int dIdx = dgz * GRID + dgx;
     duckIn[0] = ov::float16(g_duckX);
     duckIn[1] = ov::float16(g_duckZ);
     duckIn[2] = ov::float16(g_duckVX);
     duckIn[3] = ov::float16(g_duckVZ);
-    duckIn[4] = g_renderBuf[GRID * GRID + dIdx];      // slope_x (dhdx_sc)
-    duckIn[5] = g_renderBuf[2 * GRID * GRID + dIdx];  // slope_z (dhdz_sc)
 
     // Input 4: delta time [1, 1, 1, 1] — for frame-rate independent physics
     auto dtTensor = g_infer.get_input_tensor(4);
     dtTensor.data<ov::float16>()[0] = ov::float16(g_dt);
 
-    // Single inference: waves + ripples + caustics + refraction + duck physics
+    // Input 5: ball state [1, 6, 1, 1] = (x, z, vx, vz, radius, push)
+    // Uses midpoint of prev→current for better coverage on fast drags
+    auto ballTensor = g_infer.get_input_tensor(5);
+    auto* ballData = ballTensor.data<ov::float16>();
+    float bvx = g_ballX - g_ballPrevX;
+    float bvz = g_ballZ - g_ballPrevZ;
+    float bspeed = sqrtf(bvx * bvx + bvz * bvz);
+    float bmidX = (g_ballX + g_ballPrevX) * 0.5f;
+    float bmidZ = (g_ballZ + g_ballPrevZ) * 0.5f;
+    ballData[0] = ov::float16(bmidX);
+    ballData[1] = ov::float16(bmidZ);
+    ballData[2] = ov::float16(bvx);
+    ballData[3] = ov::float16(bvz);
+    ballData[4] = ov::float16(g_ballRadius);
+    ballData[5] = ov::float16((g_dragging && bspeed >= 0.1f) ? g_ballMovePush : 0.0f);
+    g_ballPrevX = g_ballX;
+    g_ballPrevZ = g_ballZ;
+
+    // Single inference: waves + ripples + caustics + refraction + duck + ball physics
     g_infer.infer();
 
     // Output 0: new simulation state
@@ -1077,11 +1027,6 @@ static void runSimulation() {
     g_duckZ  = float(duckResult[1]);
     g_duckVX = float(duckResult[2]);
     g_duckVZ = float(duckResult[3]);
-
-    // Wall bounce: if NPU clamped position, reverse velocity
-    float duckHalf = GRID * 0.5f - DUCK_SCALE;
-    if (g_duckX <= -duckHalf || g_duckX >= duckHalf) g_duckVX *= -0.5f;
-    if (g_duckZ <= -duckHalf || g_duckZ >= duckHalf) g_duckVZ *= -0.5f;
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,7 +1114,7 @@ static void render() {
     g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
     g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
 
-    float angle   = g_time * g_camSpeed;
+    float angle   = g_time * g_camSpeed + g_camAngle;
     float camDist = GRID * g_camDist;
     float camH    = GRID * g_camHeight;
     XMVECTOR eye = XMVectorSet(cosf(angle) * camDist, camH, sinf(angle) * camDist, 0.0f);
@@ -1370,9 +1315,13 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEMOVE: {
+        float mx = static_cast<float>(LOWORD(lp));
+        float my = static_cast<float>(HIWORD(lp));
+        if (g_rDragging) {
+            float dx = mx - g_rDragStartX;
+            g_camAngle = g_rDragStartAngle - dx * 0.01f;
+        }
         if (g_dragging) {
-            float mx = static_cast<float>(LOWORD(lp));
-            float my = static_cast<float>(HIWORD(lp));
             float wx, wz;
             if (mouseToWaterPlane(mx, my, wx, wz)) {
                 float half = GRID * 0.5f - g_ballRadius;
@@ -1388,9 +1337,31 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONUP:
         if (g_dragging) {
             g_dragging = false;
-            ReleaseCapture();
+            if (!g_rDragging) ReleaseCapture();
         }
         return 0;
+
+    case WM_RBUTTONDOWN: {
+        g_rDragging = true;
+        g_rDragStartX = static_cast<float>(LOWORD(lp));
+        g_rDragStartAngle = g_camAngle;
+        SetCapture(hwnd);
+        return 0;
+    }
+
+    case WM_RBUTTONUP:
+        if (g_rDragging) {
+            g_rDragging = false;
+            if (!g_dragging) ReleaseCapture();
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL: {
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        g_camDist *= (delta > 0) ? 0.9f : 1.1f;
+        g_camDist = std::max(0.3f, std::min(2.0f, g_camDist));
+        return 0;
+    }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -1428,7 +1399,7 @@ int main(int argc, char* argv[]) {
 
     printf("=== Ocean Simulation [%s] ===\n", g_device.c_str());
     printf("32 Gerstner waves + interactive ripples, all FP16 on %s\n", g_device.c_str());
-    printf("Controls:  Drag = ball | Space = splash | R = reset | T = sliders | Esc = quit\n\n");
+    printf("Controls:  Left-drag = ball | Right-drag = rotate | Scroll = zoom | Space = splash | R = reset | T = sliders | Esc = quit\n\n");
 
     initD3D();
     printf("[OK] D3D11 device created\n");
@@ -1472,7 +1443,6 @@ int main(int argc, char* argv[]) {
             simAccum -= SIM_DT;
             g_time += SIM_DT;
             if (g_time >= 50.0f) g_time -= 50.0f;  // for camera animation
-            applyBall();
             updateDuck();
             runSimulation();
             updateMesh();

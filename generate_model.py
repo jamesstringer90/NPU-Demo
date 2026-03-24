@@ -200,6 +200,15 @@ def create_model(output_path: str):
     wake_neg_inv_rw = np.array([[[[-1.0 / 0.12]]]], dtype=np.float16)
     wake_strength = np.array([[[[0.03]]]], dtype=np.float16)  # per second (scaled by dt)
 
+    # Duck slope sampling: wide Gaussian (σ²=64) — mean(w)≈0.006, FP16-safe
+    sample_neg_inv_s2 = np.array([[[[-1.0 / 128.0]]]], dtype=np.float16)  # -1/(2×64)
+    # Duck wall bounce: factor = 1.0 - 1.5 × hit → -0.5 on wall hit
+    bounce_1p5 = np.array([[[[1.5]]]], dtype=np.float16)
+
+    # Ball splash constants
+    ball_cutoff_15 = np.array([[[[1.5]]]], dtype=np.float16)   # matches CPU `dist2 > R*R*1.5f`
+    ball_pt4 = np.array([[[[0.4]]]], dtype=np.float16)          # matches CPU `speed / (radius * 0.4)`
+
     initializers = [
         numpy_helper.from_array(ripple_k, "ripple_kernel"),
         numpy_helper.from_array(ddx_w,    "ddx_w"),
@@ -221,6 +230,7 @@ def create_model(output_path: str):
         numpy_helper.from_array(duck_pos_max, "duck_pos_max"),
         numpy_helper.from_array(np.array([1, 1], dtype=np.int64), "split2"),
         numpy_helper.from_array(np.array([1, 1, 1], dtype=np.int64), "split3"),
+        numpy_helper.from_array(np.array([1, 1, 1, 1], dtype=np.int64), "split4"),
         numpy_helper.from_array(np.array([1, 1, 1, 1, 1, 1], dtype=np.int64), "split6"),
         numpy_helper.from_array(hull_neg_inv_2s2, "hull_neg_inv_2s2"),
         numpy_helper.from_array(hull_depth, "hull_depth"),
@@ -232,6 +242,10 @@ def create_model(output_path: str):
         numpy_helper.from_array(wake_ring_peak, "wake_ring_peak"),
         numpy_helper.from_array(wake_neg_inv_rw, "wake_neg_inv_rw"),
         numpy_helper.from_array(wake_strength, "wake_strength"),
+        numpy_helper.from_array(sample_neg_inv_s2, "sample_neg_inv_s2"),
+        numpy_helper.from_array(bounce_1p5, "bounce_1p5"),
+        numpy_helper.from_array(ball_cutoff_15, "ball_cutoff_15"),
+        numpy_helper.from_array(ball_pt4, "ball_pt4"),
     ]
 
     # Precompute per-wave constants — packed into batch tensors
@@ -278,9 +292,11 @@ def create_model(output_path: str):
     camera_in = helper.make_tensor_value_info(
         "camera", TensorProto.FLOAT16, [1, 3, 1, 1])
     duck_in = helper.make_tensor_value_info(
-        "duck_in", TensorProto.FLOAT16, [1, 6, 1, 1])
+        "duck_in", TensorProto.FLOAT16, [1, 4, 1, 1])
     dt_in = helper.make_tensor_value_info(
         "dt", TensorProto.FLOAT16, [1, 1, 1, 1])
+    ball_in = helper.make_tensor_value_info(
+        "ball_in", TensorProto.FLOAT16, [1, 6, 1, 1])
 
     nodes = []
 
@@ -320,8 +336,8 @@ def create_model(output_path: str):
     # DUCK INPUT SPLIT — needed before ripple loop for hull displacement
     # ================================================================
     nodes.append(helper.make_node(
-        "Split", ["duck_in", "split6"],
-        ["duck_x", "duck_z", "duck_vx", "duck_vz", "dk_slope_x", "dk_slope_z"],
+        "Split", ["duck_in", "split4"],
+        ["duck_x", "duck_z", "duck_vx", "duck_vz"],
         axis=1))
 
     # ================================================================
@@ -381,7 +397,78 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Mul", ["wake_fr", "wake_speed"], ["wake_frs"]))
     nodes.append(helper.make_node("Mul", ["wake_frs", "wake_strength"], ["wake_impulse_ps"]))
     nodes.append(helper.make_node("Mul", ["wake_impulse_ps", "dt"], ["wake_impulse"]))
-    nodes.append(helper.make_node("Add", ["rh_hulled", "wake_impulse"], ["rh_ready"]))
+    nodes.append(helper.make_node("Add", ["rh_hulled", "wake_impulse"], ["rh_duck_ready"]))
+
+    # ================================================================
+    # NPU BALL SPLASH — exact port of CPU applyBall()
+    # Gaussian ring at ~0.8*R, facing dot, hard cutoff at 1.5*R² and < 1.0
+    # CPU packs ball_in = (x, z, vx, vz, radius, push) — push=0 when idle
+    # ================================================================
+    nodes.append(helper.make_node(
+        "Split", ["ball_in", "split6"],
+        ["ball_x", "ball_z", "ball_vx", "ball_vz", "ball_radius", "ball_push"],
+        axis=1))
+    # Distance from ball to each grid cell
+    nodes.append(helper.make_node("Sub", ["x_grid", "ball_x"], ["ball_dx"]))
+    nodes.append(helper.make_node("Sub", ["z_grid", "ball_z"], ["ball_dz"]))
+    nodes.append(helper.make_node("Mul", ["ball_dx", "ball_dx"], ["ball_dx2"]))
+    nodes.append(helper.make_node("Mul", ["ball_dz", "ball_dz"], ["ball_dz2"]))
+    nodes.append(helper.make_node("Add", ["ball_dx2", "ball_dz2"], ["ball_dist2"]))
+    nodes.append(helper.make_node("Add", ["ball_dist2", "wake_epsilon2"], ["ball_dist2s"]))
+    nodes.append(helper.make_node("Sqrt", ["ball_dist2s"], ["ball_dist"]))
+
+    # Cutoff mask: 1.0 where 1.0 <= dist2 <= R*R*1.5, 0.0 elsewhere
+    # This matches the CPU's `if (dist2 > R*R*1.5f || dist2 < 1.0f) continue;`
+    # outer_limit = R * R * 1.5
+    nodes.append(helper.make_node("Mul", ["ball_radius", "ball_radius"], ["ball_R2"]))
+    nodes.append(helper.make_node("Mul", ["ball_R2", "ball_cutoff_15"], ["ball_outer_lim"]))
+    # outer_ok = clip((outer_lim - dist2) * big, 0, 1) → 1 inside, 0 outside
+    nodes.append(helper.make_node("Sub", ["ball_outer_lim", "ball_dist2"], ["ball_outer_diff"]))
+    nodes.append(helper.make_node("Mul", ["ball_outer_diff", "wrap_scale"], ["ball_outer_sc"]))
+    nodes.append(helper.make_node("Clip", ["ball_outer_sc", "hull_clip_zero", "hull_clip_one"], ["ball_outer_ok"]))
+    # inner_ok = clip((dist2 - 1.0) * big, 0, 1) → 0 at center, 1 outside
+    nodes.append(helper.make_node("Sub", ["ball_dist2", "hull_clip_one"], ["ball_inner_diff"]))
+    nodes.append(helper.make_node("Mul", ["ball_inner_diff", "wrap_scale"], ["ball_inner_sc"]))
+    nodes.append(helper.make_node("Clip", ["ball_inner_sc", "hull_clip_zero", "hull_clip_one"], ["ball_inner_ok"]))
+    nodes.append(helper.make_node("Mul", ["ball_outer_ok", "ball_inner_ok"], ["ball_cutoff_mask"]))
+
+    # Normalized distance: tn = dist / radius
+    nodes.append(helper.make_node("Div", ["ball_dist", "ball_radius"], ["ball_tn"]))
+    # Gaussian ring profile peaked at ~0.8*radius: exp(-((tn - 0.8)² / 0.12))
+    nodes.append(helper.make_node("Sub", ["ball_tn", "wake_ring_peak"], ["ball_tn_off"]))
+    nodes.append(helper.make_node("Mul", ["ball_tn_off", "ball_tn_off"], ["ball_tn_off2"]))
+    nodes.append(helper.make_node("Mul", ["ball_tn_off2", "wake_neg_inv_rw"], ["ball_ring_arg"]))
+    nodes.append(helper.make_node("Exp", ["ball_ring_arg"], ["ball_ring_raw"]))
+    # Apply cutoff mask
+    nodes.append(helper.make_node("Mul", ["ball_ring_raw", "ball_cutoff_mask"], ["ball_ring"]))
+
+    # Cell direction (normalized)
+    nodes.append(helper.make_node("Div", ["ball_dx", "ball_dist"], ["ball_nx"]))
+    nodes.append(helper.make_node("Div", ["ball_dz", "ball_dist"], ["ball_nz"]))
+    # Ball speed + normalized direction
+    nodes.append(helper.make_node("Mul", ["ball_vx", "ball_vx"], ["ball_svx2"]))
+    nodes.append(helper.make_node("Mul", ["ball_vz", "ball_vz"], ["ball_svz2"]))
+    nodes.append(helper.make_node("Add", ["ball_svx2", "ball_svz2"], ["ball_spd2"]))
+    nodes.append(helper.make_node("Add", ["ball_spd2", "wake_epsilon2"], ["ball_spd2s"]))
+    nodes.append(helper.make_node("Sqrt", ["ball_spd2s"], ["ball_speed"]))
+    nodes.append(helper.make_node("Div", ["ball_vx", "ball_speed"], ["ball_mdx"]))
+    nodes.append(helper.make_node("Div", ["ball_vz", "ball_speed"], ["ball_mdz"]))
+    # facing = dot(cell_dir, velocity_dir)
+    nodes.append(helper.make_node("Mul", ["ball_nx", "ball_mdx"], ["ball_fx"]))
+    nodes.append(helper.make_node("Mul", ["ball_nz", "ball_mdz"], ["ball_fz"]))
+    nodes.append(helper.make_node("Add", ["ball_fx", "ball_fz"], ["ball_facing"]))
+    # invSteps: matches CPU numSteps = max(1, floor(speed / (radius * 0.4)) + 1)
+    nodes.append(helper.make_node("Mul", ["ball_radius", "ball_pt4"], ["ball_step_denom"]))
+    nodes.append(helper.make_node("Div", ["ball_speed", "ball_step_denom"], ["ball_step_raw"]))
+    nodes.append(helper.make_node("Floor", ["ball_step_raw"], ["ball_step_floor"]))
+    nodes.append(helper.make_node("Add", ["ball_step_floor", "hull_clip_one"], ["ball_numsteps"]))
+    nodes.append(helper.make_node("Reciprocal", ["ball_numsteps"], ["ball_invsteps"]))
+    # impulse = facing * ring * push * speed * invSteps (push=0 when idle → zero)
+    nodes.append(helper.make_node("Mul", ["ball_facing", "ball_ring"], ["ball_fr"]))
+    nodes.append(helper.make_node("Mul", ["ball_fr", "ball_speed"], ["ball_frs"]))
+    nodes.append(helper.make_node("Mul", ["ball_frs", "ball_push"], ["ball_frsp"]))
+    nodes.append(helper.make_node("Mul", ["ball_frsp", "ball_invsteps"], ["ball_impulse"]))
+    nodes.append(helper.make_node("Add", ["rh_duck_ready", "ball_impulse"], ["rh_ready"]))
 
     rh, rhp = "rh_ready", "rhp_in"
     for step in range(RIPPLE_STEPS):
@@ -456,8 +543,24 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Mul", ["refract_base_z", "sec_theta"], ["refract_z"]))
 
     # ================================================================
+    # DUCK SLOPE SAMPLING — wide Gaussian weighted average (σ²=64, FP16-safe)
+    # mean(w)≈0.006 — well above FP16 min normal (6e-5)
+    # Reuses hull_dist2 from hull displacement section
+    # ================================================================
+    nodes.append(helper.make_node("Mul", ["hull_dist2", "sample_neg_inv_s2"], ["sample_exp_arg"]))
+    nodes.append(helper.make_node("Exp", ["sample_exp_arg"], ["sample_w"]))
+    nodes.append(helper.make_node("Mul", ["sample_w", "dhdx_sc"], ["sample_wx"]))
+    nodes.append(helper.make_node("Mul", ["sample_w", "dhdy_sc"], ["sample_wz"]))
+    nodes.append(helper.make_node("GlobalAveragePool", ["sample_wx"], ["slope_x_mean"]))
+    nodes.append(helper.make_node("GlobalAveragePool", ["sample_wz"], ["slope_z_mean"]))
+    nodes.append(helper.make_node("GlobalAveragePool", ["sample_w"], ["w_mean"]))
+    nodes.append(helper.make_node("Add", ["w_mean", "wake_epsilon2"], ["w_mean_safe"]))
+    nodes.append(helper.make_node("Div", ["slope_x_mean", "w_mean_safe"], ["dk_slope_x"]))
+    nodes.append(helper.make_node("Div", ["slope_z_mean", "w_mean_safe"], ["dk_slope_z"]))
+
+    # ================================================================
     # DUCK PHYSICS — free-floating rubber duck on NPU (dt-scaled)
-    # duck_in already split above (before ripple loop)
+    # Slope sampled on NPU via Gaussian-weighted GlobalAveragePool
     # ================================================================
     # force_impulse = slope * force * dt
     nodes.append(helper.make_node("Mul", ["dk_slope_x", "duck_force"], ["dk_fx_ps"]))
@@ -484,9 +587,27 @@ def create_model(output_path: str):
     nodes.append(helper.make_node(
         "Clip", ["dk_z_raw", "duck_pos_min", "duck_pos_max"], ["dk_z_clamp"]))
 
-    # Duck output: [1, 4, 1, 1] = (x, z, vx, vz)
+    # Wall bounce: if position was clamped, flip velocity × -0.5
+    # bounce_factor = 1.0 - 1.5 × was_clamped → 1.0 (free) or -0.5 (wall hit)
+    nodes.append(helper.make_node("Sub", ["dk_x_raw", "dk_x_clamp"], ["bounce_dx"]))
+    nodes.append(helper.make_node("Abs", ["bounce_dx"], ["bounce_dx_abs"]))
+    nodes.append(helper.make_node("Mul", ["bounce_dx_abs", "wrap_scale"], ["bounce_dx_sc"]))
+    nodes.append(helper.make_node("Clip", ["bounce_dx_sc", "hull_clip_zero", "hull_clip_one"], ["bounce_x_hit"]))
+    nodes.append(helper.make_node("Mul", ["bounce_x_hit", "bounce_1p5"], ["bounce_x_off"]))
+    nodes.append(helper.make_node("Sub", ["hull_clip_one", "bounce_x_off"], ["bounce_x_fac"]))
+    nodes.append(helper.make_node("Mul", ["dk_vx_new", "bounce_x_fac"], ["dk_vx_bounced"]))
+
+    nodes.append(helper.make_node("Sub", ["dk_z_raw", "dk_z_clamp"], ["bounce_dz"]))
+    nodes.append(helper.make_node("Abs", ["bounce_dz"], ["bounce_dz_abs"]))
+    nodes.append(helper.make_node("Mul", ["bounce_dz_abs", "wrap_scale"], ["bounce_dz_sc"]))
+    nodes.append(helper.make_node("Clip", ["bounce_dz_sc", "hull_clip_zero", "hull_clip_one"], ["bounce_z_hit"]))
+    nodes.append(helper.make_node("Mul", ["bounce_z_hit", "bounce_1p5"], ["bounce_z_off"]))
+    nodes.append(helper.make_node("Sub", ["hull_clip_one", "bounce_z_off"], ["bounce_z_fac"]))
+    nodes.append(helper.make_node("Mul", ["dk_vz_new", "bounce_z_fac"], ["dk_vz_bounced"]))
+
+    # Duck output: [1, 4, 1, 1] = (x, z, vx, vz) with wall bounce applied
     nodes.append(helper.make_node("Concat",
-        ["dk_x_clamp", "dk_z_clamp", "dk_vx_new", "dk_vz_new"],
+        ["dk_x_clamp", "dk_z_clamp", "dk_vx_bounced", "dk_vz_bounced"],
         ["duck_out"], axis=1))
 
     nodes.append(helper.make_node("Concat",
@@ -510,7 +631,7 @@ def create_model(output_path: str):
 
     graph = helper.make_graph(
         nodes, "ocean_npu",
-        [state_in, wave_phase_in, camera_in, duck_in, dt_in],
+        [state_in, wave_phase_in, camera_in, duck_in, dt_in, ball_in],
         [state_out, render_out, duck_out, wave_phase_out_info],
         initializer=initializers,
     )
@@ -534,6 +655,7 @@ def create_model(output_path: str):
     print(f"  Caustics      : Laplacian convolution on NPU")
     print(f"  Refraction    : Snell's law + view-angle correction on NPU")
     print(f"  Duck physics  : hull displacement + wake + Newtonian drift on NPU")
+    print(f"  Ball splash   : directional ring impulse on NPU")
     print(f"  Total nodes   : {total}")
 
 

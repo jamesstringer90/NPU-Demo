@@ -12,18 +12,21 @@ https://github.com/user-attachments/assets/6e632d36-5d03-4ab2-be6c-53e98c07bb05
 
 - **32 Gerstner waves** — Phillips spectrum with deep-water dispersion, packed into batch tensors
 - **Interactive ripple layer** — 8-substep Verlet wave equation with damping
-- **Duck physics** — hull displacement, directional wake injection, Newtonian drift
+- **Duck physics** — hull displacement, directional wake injection, Newtonian drift, slope sampling, wall bounce
+- **Ball splash** — directional ring impulse with path interpolation scaling
 - **Caustics** — Laplacian convolution with Gaussian pre-smoothing
 - **Refraction** — Snell's law with view-angle correction (per-cell sec(theta))
 - **Surface normals** — finite-difference derivatives for lighting
 
-All 135 ONNX nodes execute in a single inference call at FP16 precision.
+All 204 ONNX nodes execute in a single inference call at FP16 precision.
 
 ## Controls
 
-| Key | Action |
-|-----|--------|
-| Left-drag | Drag ball through water |
+| Input | Action |
+|-------|--------|
+| Left-click drag | Drag ball through water |
+| Right-click drag | Rotate camera |
+| Scroll wheel | Zoom in/out |
 | Space | Splash at center |
 | R | Reset simulation |
 | T | Toggle tuning slider panel |
@@ -79,13 +82,15 @@ npu_water_sim.vcxproj      VS2022 project (copies DLLs + model on build)
 ### Data flow per frame
 
 ```
-CPU: state + wave_phase + camera + duck + dt
+CPU: state + wave_phase + camera + duck + ball + dt
   |
   v
-NPU: single ONNX inference (135 nodes, FP16)
+NPU: single ONNX inference (204 nodes, FP16)
   |   - Gerstner wave synthesis (batch Sin + 1x1 Conv)
   |   - Ripple propagation (8x Verlet substeps)
   |   - Hull displacement + wake injection
+  |   - Ball splash (ring impulse + facing dot)
+  |   - Duck slope sampling + physics + wall bounce
   |   - Caustics + refraction + normals
   |
   v
