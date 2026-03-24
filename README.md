@@ -2,9 +2,9 @@
 
 A proof-of-concept demonstrating the Intel NPU (Neural Processing Unit) as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the Intel AI Boost NPU via the OpenVINO C++ inference API. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
-I'm not a game developer and I have no background in simulation — I just wanted to see if the NPU could do something other than AI. Turns out it can.
-
 **There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as a 216-node tensor graph running at FP16 precision. The NPU doesn't know it's not running a neural network; it just sees tensor operations.
+
+I'm not a game developer and I have no background in simulation — I just wanted to see if the NPU could do something other than AI. Turns out it can.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
