@@ -200,11 +200,29 @@ def create_model(output_path: str):
     wake_neg_inv_rw = np.array([[[[-1.0 / 0.12]]]], dtype=np.float16)
     wake_strength = np.array([[[[0.03]]]], dtype=np.float16)  # per second (scaled by dt)
 
+    # Duck bow wave: Gaussian mound pushed ahead of duck, proportional to speed
+    bow_sigma2 = np.array([[[[-1.0 / (2.0 * (DUCK_R * 0.5) ** 2)]]]], dtype=np.float16)  # tighter than hull
+    bow_strength = np.array([[[[0.015]]]], dtype=np.float16)  # per second
+    bow_offset_scale = np.array([[[[DUCK_R * 0.7]]]], dtype=np.float16)  # how far ahead of duck
+
     # Duck slope sampling: Gaussian (σ²=4, σ=2 cells) — mean(w)≈3.8e-4, FP16-safe
     sample_neg_inv_s2 = np.array([[[[-0.125]]]], dtype=np.float16)  # -1/(2×4)
     slope_prescale = np.array([[[[512.0]]]], dtype=np.float16)       # prevent numerator underflow
     # Duck wall bounce: factor = 1.0 - 1.5 × hit → -0.5 on wall hit
     bounce_1p5 = np.array([[[[1.5]]]], dtype=np.float16)
+
+    # Ball-duck collision constants
+    DUCK_SCALE = 45.0
+    col_min_dist = np.array([[[[DUCK_SCALE * 0.5]]]], dtype=np.float16)  # duck half-size
+    col_pos_push = np.array([[[[0.5]]]], dtype=np.float16)   # position separation
+    col_vel_push = np.array([[[[8.0]]]], dtype=np.float16)   # velocity impulse
+
+    # Duck buoyancy + tilt constants
+    duck_y_offset = np.array([[[[DUCK_SCALE * 0.35]]]], dtype=np.float16)  # bob offset
+    bob_smooth = np.array([[[[0.4]]]], dtype=np.float16)
+    bob_retain = np.array([[[[0.6]]]], dtype=np.float16)
+    tilt_smooth = np.array([[[[0.3]]]], dtype=np.float16)
+    tilt_retain = np.array([[[[0.7]]]], dtype=np.float16)
 
     # Ball splash constants
     ball_cutoff_15 = np.array([[[[1.5]]]], dtype=np.float16)   # matches CPU `dist2 > R*R*1.5f`
@@ -240,6 +258,7 @@ def create_model(output_path: str):
         numpy_helper.from_array(np.array([1, 1, 1], dtype=np.int64), "split3"),
         numpy_helper.from_array(np.array([1, 1, 1, 1], dtype=np.int64), "split4"),
         numpy_helper.from_array(np.array([1, 1, 1, 1, 1, 1], dtype=np.int64), "split6"),
+        numpy_helper.from_array(np.array([1, 1, 1, 1, 1, 1, 1], dtype=np.int64), "split7"),
         numpy_helper.from_array(hull_neg_inv_2s2, "hull_neg_inv_2s2"),
         numpy_helper.from_array(hull_depth, "hull_depth"),
         numpy_helper.from_array(hull_cutoff_thresh, "hull_cutoff_thresh"),
@@ -250,6 +269,9 @@ def create_model(output_path: str):
         numpy_helper.from_array(wake_ring_peak, "wake_ring_peak"),
         numpy_helper.from_array(wake_neg_inv_rw, "wake_neg_inv_rw"),
         numpy_helper.from_array(wake_strength, "wake_strength"),
+        numpy_helper.from_array(bow_sigma2, "bow_sigma2"),
+        numpy_helper.from_array(bow_strength, "bow_strength"),
+        numpy_helper.from_array(bow_offset_scale, "bow_offset_scale"),
         numpy_helper.from_array(sample_neg_inv_s2, "sample_neg_inv_s2"),
         numpy_helper.from_array(slope_prescale, "slope_prescale"),
         numpy_helper.from_array(bounce_1p5, "bounce_1p5"),
@@ -258,6 +280,14 @@ def create_model(output_path: str):
         numpy_helper.from_array(ripple_clip_min, "ripple_clip_min"),
         numpy_helper.from_array(ripple_clip_max, "ripple_clip_max"),
         numpy_helper.from_array(splash_neg4, "splash_neg4"),
+        numpy_helper.from_array(col_min_dist, "col_min_dist"),
+        numpy_helper.from_array(col_pos_push, "col_pos_push"),
+        numpy_helper.from_array(col_vel_push, "col_vel_push"),
+        numpy_helper.from_array(duck_y_offset, "duck_y_offset"),
+        numpy_helper.from_array(bob_smooth, "bob_smooth"),
+        numpy_helper.from_array(bob_retain, "bob_retain"),
+        numpy_helper.from_array(tilt_smooth, "tilt_smooth"),
+        numpy_helper.from_array(tilt_retain, "tilt_retain"),
     ]
 
     # Precompute per-wave constants — packed into batch tensors
@@ -304,11 +334,11 @@ def create_model(output_path: str):
     camera_in = helper.make_tensor_value_info(
         "camera", TensorProto.FLOAT16, [1, 3, 1, 1])
     duck_in = helper.make_tensor_value_info(
-        "duck_in", TensorProto.FLOAT16, [1, 4, 1, 1])
+        "duck_in", TensorProto.FLOAT16, [1, 7, 1, 1])
     dt_in = helper.make_tensor_value_info(
         "dt", TensorProto.FLOAT16, [1, 1, 1, 1])
     ball_in = helper.make_tensor_value_info(
-        "ball_in", TensorProto.FLOAT16, [1, 6, 1, 1])
+        "ball_in", TensorProto.FLOAT16, [1, 7, 1, 1])
     splash_in = helper.make_tensor_value_info(
         "splash_in", TensorProto.FLOAT16, [1, 4, 1, 1])
 
@@ -350,8 +380,8 @@ def create_model(output_path: str):
     # DUCK INPUT SPLIT — needed before ripple loop for hull displacement
     # ================================================================
     nodes.append(helper.make_node(
-        "Split", ["duck_in", "split4"],
-        ["duck_x", "duck_z", "duck_vx", "duck_vz"],
+        "Split", ["duck_in", "split7"],
+        ["duck_x", "duck_z", "duck_vx", "duck_vz", "duck_y", "duck_tiltx", "duck_tiltz"],
         axis=1))
 
     # ================================================================
@@ -411,7 +441,31 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Mul", ["wake_fr", "wake_speed"], ["wake_frs"]))
     nodes.append(helper.make_node("Mul", ["wake_frs", "wake_strength"], ["wake_impulse_ps"]))
     nodes.append(helper.make_node("Mul", ["wake_impulse_ps", "dt"], ["wake_impulse"]))
-    nodes.append(helper.make_node("Add", ["rh_hulled", "wake_impulse"], ["rh_duck_ready"]))
+    nodes.append(helper.make_node("Add", ["rh_hulled", "wake_impulse"], ["rh_wake_done"]))
+
+    # ================================================================
+    # NPU BOW WAVE — Gaussian mound ahead of duck, proportional to speed
+    # Center is offset from duck position in the direction of travel
+    # ================================================================
+    # Bow center = duck_pos + velocity_dir * offset_scale
+    nodes.append(helper.make_node("Mul", ["wake_mdx", "bow_offset_scale"], ["bow_off_x"]))
+    nodes.append(helper.make_node("Mul", ["wake_mdz", "bow_offset_scale"], ["bow_off_z"]))
+    nodes.append(helper.make_node("Add", ["duck_x", "bow_off_x"], ["bow_cx"]))
+    nodes.append(helper.make_node("Add", ["duck_z", "bow_off_z"], ["bow_cz"]))
+    # Distance from bow center to each grid cell
+    nodes.append(helper.make_node("Sub", ["x_grid", "bow_cx"], ["bow_dx"]))
+    nodes.append(helper.make_node("Sub", ["z_grid", "bow_cz"], ["bow_dz"]))
+    nodes.append(helper.make_node("Mul", ["bow_dx", "bow_dx"], ["bow_dx2"]))
+    nodes.append(helper.make_node("Mul", ["bow_dz", "bow_dz"], ["bow_dz2"]))
+    nodes.append(helper.make_node("Add", ["bow_dx2", "bow_dz2"], ["bow_dist2"]))
+    # Gaussian profile
+    nodes.append(helper.make_node("Mul", ["bow_dist2", "bow_sigma2"], ["bow_exp_arg"]))
+    nodes.append(helper.make_node("Exp", ["bow_exp_arg"], ["bow_gauss"]))
+    # Scale by speed and strength, dt-scaled
+    nodes.append(helper.make_node("Mul", ["bow_gauss", "wake_speed"], ["bow_gs"]))
+    nodes.append(helper.make_node("Mul", ["bow_gs", "bow_strength"], ["bow_impulse_ps"]))
+    nodes.append(helper.make_node("Mul", ["bow_impulse_ps", "dt"], ["bow_impulse"]))
+    nodes.append(helper.make_node("Add", ["rh_wake_done", "bow_impulse"], ["rh_duck_ready"]))
 
     # ================================================================
     # NPU BALL SPLASH — exact port of CPU applyBall()
@@ -419,8 +473,8 @@ def create_model(output_path: str):
     # CPU packs ball_in = (x, z, vx, vz, radius, push) — push=0 when idle
     # ================================================================
     nodes.append(helper.make_node(
-        "Split", ["ball_in", "split6"],
-        ["ball_x", "ball_z", "ball_vx", "ball_vz", "ball_radius", "ball_push"],
+        "Split", ["ball_in", "split7"],
+        ["ball_x", "ball_z", "ball_vx", "ball_vz", "ball_radius", "ball_push", "ball_active"],
         axis=1))
     # Distance from ball to each grid cell
     nodes.append(helper.make_node("Sub", ["x_grid", "ball_x"], ["ball_dx"]))
@@ -610,16 +664,74 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Div", ["dk_slope_z_big", "slope_prescale"], ["dk_slope_z"]))
 
     # ================================================================
+    # BALL-DUCK COLLISION — push duck away when ball overlaps
+    # Only active when ball_active > 0 (i.e. user is dragging)
+    # ================================================================
+    nodes.append(helper.make_node("Sub", ["duck_x", "ball_x"], ["col_dx"]))
+    nodes.append(helper.make_node("Sub", ["duck_z", "ball_z"], ["col_dz"]))
+    nodes.append(helper.make_node("Mul", ["col_dx", "col_dx"], ["col_dx2"]))
+    nodes.append(helper.make_node("Mul", ["col_dz", "col_dz"], ["col_dz2"]))
+    nodes.append(helper.make_node("Add", ["col_dx2", "col_dz2"], ["col_dist2"]))
+    nodes.append(helper.make_node("Add", ["col_dist2", "wake_epsilon2"], ["col_dist2s"]))
+    nodes.append(helper.make_node("Sqrt", ["col_dist2s"], ["col_dist"]))
+    # minDist = ball_radius + duck_half_scale
+    nodes.append(helper.make_node("Add", ["ball_radius", "col_min_dist"], ["col_mindist"]))
+    # overlap = max(0, minDist - dist) * active
+    nodes.append(helper.make_node("Sub", ["col_mindist", "col_dist"], ["col_overlap_raw"]))
+    nodes.append(helper.make_node("Clip", ["col_overlap_raw", "hull_clip_zero", "col_mindist"], ["col_overlap"]))
+    nodes.append(helper.make_node("Mul", ["col_overlap", "ball_active"], ["col_overlap_a"]))
+    # Push direction
+    nodes.append(helper.make_node("Div", ["col_dx", "col_dist"], ["col_nx"]))
+    nodes.append(helper.make_node("Div", ["col_dz", "col_dist"], ["col_nz"]))
+    # Velocity impulse
+    nodes.append(helper.make_node("Mul", ["col_overlap_a", "col_vel_push"], ["col_vscale"]))
+    nodes.append(helper.make_node("Mul", ["col_nx", "col_vscale"], ["col_dvx"]))
+    nodes.append(helper.make_node("Mul", ["col_nz", "col_vscale"], ["col_dvz"]))
+    nodes.append(helper.make_node("Add", ["duck_vx", "col_dvx"], ["dk_vx_col"]))
+    nodes.append(helper.make_node("Add", ["duck_vz", "col_dvz"], ["dk_vz_col"]))
+    # Position separation
+    nodes.append(helper.make_node("Mul", ["col_overlap_a", "col_pos_push"], ["col_pscale"]))
+    nodes.append(helper.make_node("Mul", ["col_nx", "col_pscale"], ["col_dpx"]))
+    nodes.append(helper.make_node("Mul", ["col_nz", "col_pscale"], ["col_dpz"]))
+    nodes.append(helper.make_node("Add", ["duck_x", "col_dpx"], ["dk_x_col"]))
+    nodes.append(helper.make_node("Add", ["duck_z", "col_dpz"], ["dk_z_col"]))
+
+    # ================================================================
+    # DUCK HEIGHT SAMPLING — Gaussian weighted average for buoyancy
+    # Reuses sample_w from slope sampling
+    # ================================================================
+    nodes.append(helper.make_node("Mul", ["sample_w", "h_sc"], ["sample_wh"]))
+    nodes.append(helper.make_node("GlobalAveragePool", ["sample_wh"], ["h_mean"]))
+    nodes.append(helper.make_node("Div", ["h_mean", "w_mean_safe"], ["dk_h_at_duck"]))
+    # buoyancy bob: duckY = duckY * 0.6 + (h + offset) * 0.4
+    nodes.append(helper.make_node("Add", ["dk_h_at_duck", "duck_y_offset"], ["dk_target_y"]))
+    nodes.append(helper.make_node("Mul", ["duck_y", "bob_retain"], ["dk_y_old"]))
+    nodes.append(helper.make_node("Mul", ["dk_target_y", "bob_smooth"], ["dk_y_new"]))
+    nodes.append(helper.make_node("Add", ["dk_y_old", "dk_y_new"], ["dk_y_out"]))
+
+    # ================================================================
+    # DUCK TILT SMOOTHING — low-pass filter on surface slope
+    # tiltX = tiltX * 0.7 + slope_x * 0.3
+    # ================================================================
+    nodes.append(helper.make_node("Mul", ["duck_tiltx", "tilt_retain"], ["dk_tiltx_old"]))
+    nodes.append(helper.make_node("Mul", ["dk_slope_x", "tilt_smooth"], ["dk_tiltx_new"]))
+    nodes.append(helper.make_node("Add", ["dk_tiltx_old", "dk_tiltx_new"], ["dk_tiltx_out"]))
+    nodes.append(helper.make_node("Mul", ["duck_tiltz", "tilt_retain"], ["dk_tiltz_old"]))
+    nodes.append(helper.make_node("Mul", ["dk_slope_z", "tilt_smooth"], ["dk_tiltz_new"]))
+    nodes.append(helper.make_node("Add", ["dk_tiltz_old", "dk_tiltz_new"], ["dk_tiltz_out"]))
+
+    # ================================================================
     # DUCK PHYSICS — free-floating rubber duck on NPU (dt-scaled)
     # Slope sampled on NPU via Gaussian-weighted GlobalAveragePool
+    # Uses collision-adjusted position and velocity
     # ================================================================
     # force_impulse = slope * force * dt
     nodes.append(helper.make_node("Mul", ["dk_slope_x", "duck_force"], ["dk_fx_ps"]))
     nodes.append(helper.make_node("Mul", ["dk_slope_z", "duck_force"], ["dk_fz_ps"]))
     nodes.append(helper.make_node("Mul", ["dk_fx_ps", "dt"], ["dk_fx"]))
     nodes.append(helper.make_node("Mul", ["dk_fz_ps", "dt"], ["dk_fz"]))
-    nodes.append(helper.make_node("Add", ["duck_vx", "dk_fx"], ["dk_vx_push"]))
-    nodes.append(helper.make_node("Add", ["duck_vz", "dk_fz"], ["dk_vz_push"]))
+    nodes.append(helper.make_node("Add", ["dk_vx_col", "dk_fx"], ["dk_vx_push"]))
+    nodes.append(helper.make_node("Add", ["dk_vz_col", "dk_fz"], ["dk_vz_push"]))
     # drag = exp(-decay_rate * dt)  — frame-rate independent exponential decay
     nodes.append(helper.make_node("Mul", ["duck_decay_rate", "dt"], ["dk_decay_dt"]))
     nodes.append(helper.make_node("Exp", ["dk_decay_dt"], ["dk_drag"]))
@@ -629,8 +741,8 @@ def create_model(output_path: str):
     # pos_new = pos + v_new * dt
     nodes.append(helper.make_node("Mul", ["dk_vx_new", "dt"], ["dk_dx_step"]))
     nodes.append(helper.make_node("Mul", ["dk_vz_new", "dt"], ["dk_dz_step"]))
-    nodes.append(helper.make_node("Add", ["duck_x", "dk_dx_step"], ["dk_x_raw"]))
-    nodes.append(helper.make_node("Add", ["duck_z", "dk_dz_step"], ["dk_z_raw"]))
+    nodes.append(helper.make_node("Add", ["dk_x_col", "dk_dx_step"], ["dk_x_raw"]))
+    nodes.append(helper.make_node("Add", ["dk_z_col", "dk_dz_step"], ["dk_z_raw"]))
 
     # Clamp position to grid bounds
     nodes.append(helper.make_node(
@@ -656,9 +768,10 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Sub", ["hull_clip_one", "bounce_z_off"], ["bounce_z_fac"]))
     nodes.append(helper.make_node("Mul", ["dk_vz_new", "bounce_z_fac"], ["dk_vz_bounced"]))
 
-    # Duck output: [1, 4, 1, 1] = (x, z, vx, vz) with wall bounce applied
+    # Duck output: [1, 7, 1, 1] = (x, z, vx, vz, y, tiltX, tiltZ)
     nodes.append(helper.make_node("Concat",
-        ["dk_x_clamp", "dk_z_clamp", "dk_vx_bounced", "dk_vz_bounced"],
+        ["dk_x_clamp", "dk_z_clamp", "dk_vx_bounced", "dk_vz_bounced",
+         "dk_y_out", "dk_tiltx_out", "dk_tiltz_out"],
         ["duck_out"], axis=1))
 
     nodes.append(helper.make_node("Concat",
@@ -676,7 +789,7 @@ def create_model(output_path: str):
     render_out = helper.make_tensor_value_info(
         "render_out", TensorProto.FLOAT16, [1, 6, N, N])
     duck_out = helper.make_tensor_value_info(
-        "duck_out", TensorProto.FLOAT16, [1, 4, 1, 1])
+        "duck_out", TensorProto.FLOAT16, [1, 7, 1, 1])
     wave_phase_out_info = helper.make_tensor_value_info(
         "wave_phase_out", TensorProto.FLOAT16, [1, N_WAVES, 1, 1])
 

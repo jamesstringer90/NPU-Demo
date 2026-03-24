@@ -69,7 +69,7 @@ static float g_rDragStartAngle = 0.0f; // camAngle at right-click start
 // Ball interaction
 static float g_ballRadius   = 15.62f;
 static float g_ballDepth    = 0.15f;
-static float g_ballMovePush = 0.06f;
+static float g_ballMovePush = 0.03f;
 
 // ---------------------------------------------------------------------------
 // Vertex layout
@@ -963,20 +963,22 @@ static void runSimulation() {
     camData[1] = ov::float16(camH);                       // eye_y
     camData[2] = ov::float16(sinf(camAngle) * camDist);  // eye_z
 
-    // Input 3: duck state [1, 4, 1, 1] = (x, z, vx, vz)
-    // Slope sampling and wall bounce both computed on NPU
+    // Input 3: duck state [1, 7, 1, 1] = (x, z, vx, vz, y, tiltX, tiltZ)
     auto duckTensor = g_infer.get_input_tensor(3);
     auto* duckIn = duckTensor.data<ov::float16>();
     duckIn[0] = ov::float16(g_duckX);
     duckIn[1] = ov::float16(g_duckZ);
     duckIn[2] = ov::float16(g_duckVX);
     duckIn[3] = ov::float16(g_duckVZ);
+    duckIn[4] = ov::float16(g_duckY);
+    duckIn[5] = ov::float16(g_duckTiltX);
+    duckIn[6] = ov::float16(g_duckTiltZ);
 
     // Input 4: delta time [1, 1, 1, 1] — for frame-rate independent physics
     auto dtTensor = g_infer.get_input_tensor(4);
     dtTensor.data<ov::float16>()[0] = ov::float16(g_dt);
 
-    // Input 5: ball state [1, 6, 1, 1] = (x, z, vx, vz, radius, push)
+    // Input 5: ball state [1, 7, 1, 1] = (x, z, vx, vz, radius, push, active)
     // Uses midpoint of prev→current for better coverage on fast drags
     auto ballTensor = g_infer.get_input_tensor(5);
     auto* ballData = ballTensor.data<ov::float16>();
@@ -991,6 +993,7 @@ static void runSimulation() {
     ballData[3] = ov::float16(bvz);
     ballData[4] = ov::float16(g_ballRadius);
     ballData[5] = ov::float16((g_dragging && bspeed >= 0.1f) ? g_ballMovePush : 0.0f);
+    ballData[6] = ov::float16(g_dragging ? 1.0f : 0.0f);
     g_ballPrevX = g_ballX;
     g_ballPrevZ = g_ballZ;
 
@@ -1027,10 +1030,13 @@ static void runSimulation() {
            N_WAVES * sizeof(ov::float16));
     g_duckPrevX = g_duckX;
     g_duckPrevZ = g_duckZ;
-    g_duckX  = float(duckResult[0]);
-    g_duckZ  = float(duckResult[1]);
-    g_duckVX = float(duckResult[2]);
-    g_duckVZ = float(duckResult[3]);
+    g_duckX     = float(duckResult[0]);
+    g_duckZ     = float(duckResult[1]);
+    g_duckVX    = float(duckResult[2]);
+    g_duckVZ    = float(duckResult[3]);
+    g_duckY     = float(duckResult[4]);
+    g_duckTiltX = float(duckResult[5]);
+    g_duckTiltZ = float(duckResult[6]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,40 +1079,9 @@ static void updateMesh() {
 // Update rubber duck — float on water, drift with waves, inject displacement
 // into ripple state so the NPU propagates the duck's water interaction.
 // ---------------------------------------------------------------------------
+// Duck physics (collision, buoyancy, tilt, slope drift, wall bounce) all on NPU.
+// CPU only reads back duck_out = (x, z, vx, vz, y, tiltX, tiltZ) for rendering.
 static void updateDuck() {
-    const int NN = GRID * GRID;
-
-    // Sample water height at duck position (for Y rendering)
-    int gx = static_cast<int>(g_duckX + GRID * 0.5f);
-    int gz = static_cast<int>(g_duckZ + GRID * 0.5f);
-    gx = std::max(1, std::min(GRID - 2, gx));
-    gz = std::max(1, std::min(GRID - 2, gz));
-    int idx = gz * GRID + gx;
-
-    float h = float(g_renderBuf[idx]) * g_heightScale;
-
-    // Float high — rubber duck is buoyant, only bottom ~15% submerged
-    float targetY = h + DUCK_SCALE * 0.35f;
-    g_duckY += (targetY - g_duckY) * 0.4f;  // smooth bob — duck has mass
-
-    // Ball-duck collision: push duck away when ball overlaps
-    if (g_dragging) {
-        float cdx = g_duckX - g_ballX;
-        float cdz = g_duckZ - g_ballZ;
-        float cDist = sqrtf(cdx * cdx + cdz * cdz);
-        float minDist = g_ballRadius + DUCK_SCALE * 0.5f;
-        if (cDist < minDist && cDist > 0.01f) {
-            float push = (minDist - cDist) * 2.0f;
-            float nx = cdx / cDist;
-            float nz = cdz / cDist;
-            g_duckX += nx * push * 0.5f;
-            g_duckZ += nz * push * 0.5f;
-            g_duckVX += nx * push * 8.0f;
-            g_duckVZ += nz * push * 8.0f;
-        }
-    }
-
-    // Hull displacement + wake injection now on NPU (Gaussian mask with hard cutoff)
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,19 +1169,6 @@ static void render() {
 
     // --- Rubber duck (yellow body + orange bill) ---
     {
-        int gx = static_cast<int>(g_duckX + GRID * 0.5f);
-        int gz = static_cast<int>(g_duckZ + GRID * 0.5f);
-        gx = std::max(1, std::min(GRID - 2, gx));
-        gz = std::max(1, std::min(GRID - 2, gz));
-        int di = gz * GRID + gx;
-        float dhdx = float(g_renderBuf[NN + di]);
-        float dhdz = float(g_renderBuf[2 * NN + di]);
-
-        // Low-pass filter: duck tilts slowly toward water surface (inertia)
-        const float tiltSmooth = 0.3f;  // 0=frozen, 1=instant snap
-        g_duckTiltX += (dhdx - g_duckTiltX) * tiltSmooth;
-        g_duckTiltZ += (dhdz - g_duckTiltZ) * tiltSmooth;
-
         XMVECTOR surfN = XMVector3Normalize(XMVectorSet(-g_duckTiltX, g_normalY, -g_duckTiltZ, 0));
         XMVECTOR upV = XMVectorSet(0, 1, 0, 0);
         XMVECTOR axis = XMVector3Cross(upV, surfN);
