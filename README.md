@@ -2,7 +2,7 @@
 
 A proof-of-concept demonstrating the Intel NPU (Neural Processing Unit) as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the Intel AI Boost NPU via the OpenVINO C++ inference API. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
-**There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as 216 tensor operations running at FP16 precision. The NPU doesn't know it's not running a neural network. This treats the ONNX graph as a "compute shader" for the NPU, showing that any computation expressible as a tensor graph can run on neural processing hardware that the industry markets exclusively for AI inference. This is a non-AI workload running on AI hardware — using the Intel NPU for general-purpose compute, not machine learning.
+**There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as a 216-node tensor graph running at FP16 precision. The NPU doesn't know it's not running a neural network; it just sees tensor operations.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
@@ -111,10 +111,6 @@ GPU: D3D11 vertex buffer update + pixel shading
 |-----|-----|--------|
 | Intel Core Ultra 9 285HX | Intel AI Boost (Arrow Lake) | 30 FPS |
 | Intel Core Ultra 7 256V | Intel AI Boost (Lunar Lake) | 30 FPS |
-
-## Keywords
-
-Intel NPU, Neural Processing Unit, Intel AI Boost, OpenVINO, OpenVINO C++ API, ONNX, FP16 inference, Intel Core Ultra, Arrow Lake, Lunar Lake, Meteor Lake, NPU programming, non-AI NPU workload, general-purpose NPU compute, tensor graph, hardware acceleration, NPU co-processor, D3D11, real-time simulation
 
 ## License
 
