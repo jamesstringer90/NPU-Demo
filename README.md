@@ -1,6 +1,6 @@
-# NPU Ocean Simulation
+# NPU Rubber Duck Bath Simulator
 
-Real-time ocean simulation running entirely on the Intel NPU (Neural Processing Unit) via OpenVINO. A single FP16 ONNX inference call per frame computes all physics — the CPU only copies data and builds vertex buffers, the GPU handles shading.
+Real-time rubber duck bathtub simulation running entirely on the Intel NPU (Neural Processing Unit) via OpenVINO. A single FP16 ONNX inference call per frame computes all physics — water waves, ripples, duck movement, caustics, and refraction. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
