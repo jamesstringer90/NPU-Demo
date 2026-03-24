@@ -214,6 +214,9 @@ def create_model(output_path: str):
     ripple_clip_min = np.array([-10.0], dtype=np.float16)
     ripple_clip_max = np.array([10.0], dtype=np.float16)
 
+    # Splash constants — matches CPU addSplash: height * exp(-d2 / (r2 * 0.25))
+    splash_neg4 = np.array([[[[-4.0]]]], dtype=np.float16)
+
     initializers = [
         numpy_helper.from_array(ripple_k, "ripple_kernel"),
         numpy_helper.from_array(ddx_w,    "ddx_w"),
@@ -254,6 +257,7 @@ def create_model(output_path: str):
         numpy_helper.from_array(ball_pt4, "ball_pt4"),
         numpy_helper.from_array(ripple_clip_min, "ripple_clip_min"),
         numpy_helper.from_array(ripple_clip_max, "ripple_clip_max"),
+        numpy_helper.from_array(splash_neg4, "splash_neg4"),
     ]
 
     # Precompute per-wave constants — packed into batch tensors
@@ -305,6 +309,8 @@ def create_model(output_path: str):
         "dt", TensorProto.FLOAT16, [1, 1, 1, 1])
     ball_in = helper.make_tensor_value_info(
         "ball_in", TensorProto.FLOAT16, [1, 6, 1, 1])
+    splash_in = helper.make_tensor_value_info(
+        "splash_in", TensorProto.FLOAT16, [1, 4, 1, 1])
 
     nodes = []
 
@@ -476,7 +482,34 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Mul", ["ball_fr", "ball_speed"], ["ball_frs"]))
     nodes.append(helper.make_node("Mul", ["ball_frs", "ball_push"], ["ball_frsp"]))
     nodes.append(helper.make_node("Mul", ["ball_frsp", "ball_invsteps"], ["ball_impulse"]))
-    nodes.append(helper.make_node("Add", ["rh_duck_ready", "ball_impulse"], ["rh_ready"]))
+    nodes.append(helper.make_node("Add", ["rh_duck_ready", "ball_impulse"], ["rh_ball_ready"]))
+
+    # ================================================================
+    # NPU SPLASH — Gaussian impulse at arbitrary position
+    # splash_in = (x, z, radius, height) — height=0 when no splash
+    # Matches CPU addSplash: height * exp(-4 * dist2 / r2), cutoff at dist2 < r2
+    # ================================================================
+    nodes.append(helper.make_node(
+        "Split", ["splash_in", "split4"],
+        ["splash_x", "splash_z", "splash_radius", "splash_height"],
+        axis=1))
+    nodes.append(helper.make_node("Sub", ["x_grid", "splash_x"], ["sp_dx"]))
+    nodes.append(helper.make_node("Sub", ["z_grid", "splash_z"], ["sp_dz"]))
+    nodes.append(helper.make_node("Mul", ["sp_dx", "sp_dx"], ["sp_dx2"]))
+    nodes.append(helper.make_node("Mul", ["sp_dz", "sp_dz"], ["sp_dz2"]))
+    nodes.append(helper.make_node("Add", ["sp_dx2", "sp_dz2"], ["sp_dist2"]))
+    # Gaussian: exp(-4 * dist2 / r2)
+    nodes.append(helper.make_node("Mul", ["splash_radius", "splash_radius"], ["sp_r2"]))
+    nodes.append(helper.make_node("Div", ["sp_dist2", "sp_r2"], ["sp_ratio"]))
+    nodes.append(helper.make_node("Mul", ["sp_ratio", "splash_neg4"], ["sp_exp_arg"]))
+    nodes.append(helper.make_node("Exp", ["sp_exp_arg"], ["sp_gauss"]))
+    # Cutoff: only where dist2 < r2
+    nodes.append(helper.make_node("Sub", ["sp_r2", "sp_dist2"], ["sp_cut_diff"]))
+    nodes.append(helper.make_node("Mul", ["sp_cut_diff", "wrap_scale"], ["sp_cut_sc"]))
+    nodes.append(helper.make_node("Clip", ["sp_cut_sc", "hull_clip_zero", "hull_clip_one"], ["sp_mask"]))
+    nodes.append(helper.make_node("Mul", ["sp_gauss", "sp_mask"], ["sp_masked"]))
+    nodes.append(helper.make_node("Mul", ["sp_masked", "splash_height"], ["sp_impulse"]))
+    nodes.append(helper.make_node("Add", ["rh_ball_ready", "sp_impulse"], ["rh_ready"]))
 
     rh, rhp = "rh_ready", "rhp_in"
     for step in range(RIPPLE_STEPS):
@@ -649,7 +682,7 @@ def create_model(output_path: str):
 
     graph = helper.make_graph(
         nodes, "ocean_npu",
-        [state_in, wave_phase_in, camera_in, duck_in, dt_in, ball_in],
+        [state_in, wave_phase_in, camera_in, duck_in, dt_in, ball_in, splash_in],
         [state_out, render_out, duck_out, wave_phase_out_info],
         initializer=initializers,
     )

@@ -366,6 +366,12 @@ static float g_ballPrevX = 0.0f;
 static float g_ballPrevZ = 0.0f;
 static bool  g_dragging  = false;
 
+// Splash state (consumed by NPU each frame, then cleared)
+static float g_splashX      = 0.0f;
+static float g_splashZ      = 0.0f;
+static float g_splashRadius = 0.0f;
+static float g_splashHeight = 0.0f;
+
 // ---------------------------------------------------------------------------
 // Slider panel
 // ---------------------------------------------------------------------------
@@ -485,25 +491,8 @@ static void createSliderPanel(HINSTANCE hInst) {
     ExitProcess(1);
 }
 
-// ---------------------------------------------------------------------------
-// Add a Gaussian splash to the height field
-// ---------------------------------------------------------------------------
-static void addSplash(int cx, int cy, float radius, float height) {
-    int r = static_cast<int>(radius) + 1;
-    for (int dy = -r; dy <= r; dy++) {
-        for (int dx = -r; dx <= r; dx++) {
-            int x = cx + dx, y = cy + dy;
-            if (x < 0 || x >= GRID || y < 0 || y >= GRID) continue;
-            float d2 = float(dx * dx + dy * dy);
-            float r2 = radius * radius;
-            if (d2 < r2) {
-                float v = height * expf(-d2 / (r2 * 0.25f));
-                int idx = y * GRID + x;
-                g_state[idx] = ov::float16(float(g_state[idx]) + v);
-            }
-        }
-    }
-}
+// Splash is now computed on NPU — see splash section in generate_model.py
+// CPU packs splash_in = (x, z, radius, height) in runSimulation()
 
 // ---------------------------------------------------------------------------
 // Reset simulation state
@@ -1005,7 +994,16 @@ static void runSimulation() {
     g_ballPrevX = g_ballX;
     g_ballPrevZ = g_ballZ;
 
-    // Single inference: waves + ripples + caustics + refraction + duck + ball physics
+    // Input 6: splash [1, 4, 1, 1] = (x, z, radius, height) — height=0 when idle
+    auto splashTensor = g_infer.get_input_tensor(6);
+    auto* splashData = splashTensor.data<ov::float16>();
+    splashData[0] = ov::float16(g_splashX);
+    splashData[1] = ov::float16(g_splashZ);
+    splashData[2] = ov::float16(g_splashHeight > 0.0f ? g_splashRadius : 1.0f);
+    splashData[3] = ov::float16(g_splashHeight);
+    g_splashHeight = 0.0f;  // one-shot: clear after packing
+
+    // Single inference: waves + ripples + caustics + refraction + duck + ball + splash
     g_infer.infer();
 
     // Output 0: new simulation state
@@ -1294,7 +1292,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { g_running = false; PostQuitMessage(0); }
-        if (wp == VK_SPACE)  addSplash(GRID / 2, GRID / 2, 15.0f, 0.1f);
+        if (wp == VK_SPACE) {
+            g_splashX = 0.0f; g_splashZ = 0.0f;
+            g_splashRadius = 20.0f; g_splashHeight = 0.15f;
+        }
         if (wp == 'R')       resetState();
         if (wp == 'T' && g_panelHwnd) {
             g_showPanel = !g_showPanel;
@@ -1315,6 +1316,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_ballZ     = wz;
             g_ballPrevX = wx;
             g_ballPrevZ = wz;
+            g_splashX = wx; g_splashZ = wz;
+            g_splashRadius = 20.0f; g_splashHeight = 0.15f;
             SetCapture(hwnd);
         }
         return 0;
