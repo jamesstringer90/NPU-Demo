@@ -6,6 +6,8 @@ Real-time ocean simulation running entirely on the Intel NPU (Neural Processing 
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
 ![D3D11](https://img.shields.io/badge/GPU-D3D11-orange)
 
+https://github.com/user-attachments/assets/6e632d36-5d03-4ab2-be6c-53e98c07bb05
+
 ## What runs on the NPU
 
 - **32 Gerstner waves** — Phillips spectrum with deep-water dispersion, packed into batch tensors
