@@ -356,7 +356,7 @@ static XMMATRIX g_lastVP = XMMatrixIdentity();
 static float    g_time    = 0.0f;
 static float    g_dt      = 0.033f;  // frame delta time (passed to NPU for rate-independent physics)
 static bool     g_running = true;
-static std::string g_device = "NPU";  // OpenVINO device: "NPU", "GPU", "CPU"
+static std::string g_device = "NPU";  // OpenVINO device: "NPU" or "CPU"
 static std::mt19937 g_rng{42};
 
 // Ball state
@@ -907,7 +907,12 @@ static void initOpenVINO() {
         printf("OpenVINO devices:\n");
         bool deviceFound = false;
         for (auto& d : devices) {
-            printf("  %s\n", d.c_str());
+            std::string caps;
+            try {
+                auto opt = core.get_property(d, ov::device::capabilities);
+                for (auto& c : opt) { if (!caps.empty()) caps += ", "; caps += c; }
+            } catch (...) {}
+            printf("  %-8s  [%s]\n", d.c_str(), caps.c_str());
             if (d.find(g_device) != std::string::npos) deviceFound = true;
         }
         if (!deviceFound) {
@@ -1007,6 +1012,7 @@ static void runSimulation() {
     auto stateOut = g_infer.get_output_tensor(0);
     memcpy(g_state.data(), stateOut.data<ov::float16>(),
            g_state.size() * sizeof(ov::float16));
+
 
     // Output 1: render data (h, dhdx, dhdz, caustic, refract_x, refract_z)
     auto renderOut = g_infer.get_output_tensor(1);
@@ -1370,12 +1376,16 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Entry point
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    // Parse device: --device NPU|GPU|CPU (default: NPU)
+    // Parse device: --device NPU|CPU (default: NPU)
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
             g_device = argv[++i];
-            // Normalize to uppercase
             for (auto& c : g_device) c = static_cast<char>(toupper(c));
+            if (g_device == "GPU") {
+                printf("GPU device not supported — OpenVINO GPU plugin produces numerical\n"
+                       "instability in the chained ripple substeps. Use NPU or CPU instead.\n");
+                return 1;
+            }
         }
     }
     WNDCLASSW wc{};

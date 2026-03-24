@@ -1,8 +1,8 @@
 # NPU Rubber Duck Bath Simulator
 
-A proof-of-concept demonstrating the Intel NPU as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the NPU via OpenVINO. The CPU only copies data and builds vertex buffers, the GPU handles shading.
+A proof-of-concept demonstrating the Intel NPU (Neural Processing Unit) as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the Intel AI Boost NPU via the OpenVINO C++ inference API. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
-**There is no neural network here.** The ONNX graph contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as 208 tensor operations. The NPU doesn't know it's not running a neural network. This treats ONNX as a "compute shader" for the NPU, showing that any computation expressible as a tensor graph can run on hardware that the industry markets exclusively for AI inference.
+**There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as 216 tensor operations running at FP16 precision. The NPU doesn't know it's not running a neural network. This treats the ONNX graph as a "compute shader" for the NPU, showing that any computation expressible as a tensor graph can run on neural processing hardware that the industry markets exclusively for AI inference. This is a non-AI workload running on AI hardware — using the Intel NPU for general-purpose compute, not machine learning.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
@@ -12,6 +12,8 @@ https://github.com/user-attachments/assets/6e632d36-5d03-4ab2-be6c-53e98c07bb05
 
 ## What runs on the NPU
 
+Everything below executes as a single OpenVINO inference request on the Intel NPU — no CPU fallback, no neural network, just tensor math at FP16 half-precision:
+
 - **32 Gerstner waves** — Phillips spectrum with deep-water dispersion, packed into batch tensors
 - **Interactive ripple layer** — 8-substep Verlet wave equation with damping
 - **Duck physics** — hull displacement, directional wake injection, Newtonian drift, slope sampling, wall bounce
@@ -20,7 +22,7 @@ https://github.com/user-attachments/assets/6e632d36-5d03-4ab2-be6c-53e98c07bb05
 - **Refraction** — Snell's law with view-angle correction (per-cell sec(theta))
 - **Surface normals** — finite-difference derivatives for lighting
 
-All 204 ONNX nodes execute in a single inference call at FP16 precision.
+All 216 ONNX nodes execute in a single synchronous `infer()` call at FP16 precision on the NPU device.
 
 ## Controls
 
@@ -33,20 +35,21 @@ All 204 ONNX nodes execute in a single inference call at FP16 precision.
 | R | Reset simulation |
 | T | Toggle tuning slider panel |
 | Escape | Quit |
-| `--device NPU\|GPU\|CPU` | Select compute device (default: NPU) |
+| `--device NPU\|CPU` | Select compute device (default: NPU) |
 
 ## Prerequisites
 
 - Windows 10/11 (x64)
 - Visual Studio 2022 (v143 toolset, C++17)
 - Python 3.10+ with `onnx` and `numpy`
-- Intel CPU with NPU (Core Ultra series) — or use `--device CPU`/`--device GPU`
+- [OpenVINO 2025.0](https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html) C++ runtime
+- Intel Core Ultra processor with NPU / Intel AI Boost (Arrow Lake, Lunar Lake, Meteor Lake) — or use `--device CPU` to run on CPU via OpenVINO
 
 ## Setup
 
-### 1. OpenVINO C++ Runtime
+### 1. OpenVINO C++ runtime
 
-Download the [OpenVINO 2025.0 Windows archive](https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html) (C++ archive, not pip) and extract it to:
+Download the [OpenVINO 2025.0 Windows archive](https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html) (C++ archive, not the pip package) and extract it to:
 
 ```
 openvino_rt\openvino_toolkit_windows_2025.0.0.17942.1f68be9f594_x86_64\
@@ -61,7 +64,7 @@ pip install onnx numpy
 python generate_model.py
 ```
 
-This produces `water_physics.onnx` (256x256 grid, 32 waves, ~4.5 MB).
+This produces `water_physics.onnx` — a hand-built ONNX graph (opset 13, 256×256 grid, 32 waves, ~4.5 MB) with no trained weights.
 
 ### 3. Build and run
 
@@ -69,37 +72,37 @@ Open `npu_water_sim.sln` in Visual Studio 2022, select **Debug** or **Release** 
 
 ```bash
 bin\Release\npu_water_sim.exe
-bin\Release\npu_water_sim.exe --device CPU   # run on CPU instead
+bin\Release\npu_water_sim.exe --device CPU    # run on CPU instead
 ```
 
 ## Architecture
 
 ```
-generate_model.py          ONNX model generator (Python)
-src/main.cpp               Application: D3D11 rendering + OpenVINO inference
-plugins.xml                OpenVINO plugin registry (NPU/GPU/CPU)
+generate_model.py          ONNX model builder (Python, onnx.helper API)
+src/main.cpp               D3D11 rendering + OpenVINO C++ inference API
+plugins.xml                OpenVINO plugin config (NPU/CPU devices)
 npu_water_sim.vcxproj      VS2022 project (copies DLLs + model on build)
 ```
 
 ### Data flow per frame
 
 ```
-CPU: state + wave_phase + camera + duck + ball + dt
+CPU: pack inputs (state, wave_phase, camera, duck, ball, dt)
   |
   v
-NPU: single ONNX inference (204 nodes, FP16)
+NPU: single OpenVINO infer() call (216 ONNX nodes, FP16)
   |   - Gerstner wave synthesis (batch Sin + 1x1 Conv)
-  |   - Ripple propagation (8x Verlet substeps)
+  |   - Ripple propagation (8× Verlet substeps)
   |   - Hull displacement + wake injection
   |   - Ball splash (ring impulse + facing dot)
-  |   - Duck slope sampling + physics + wall bounce
-  |   - Caustics + refraction + normals
+  |   - Duck slope sampling + Newtonian physics + wall bounce
+  |   - Caustics + refraction + surface normals
   |
   v
-CPU: read state_out + render_out + duck_out + wave_phase_out
+CPU: read outputs (state_out, render_out, duck_out, wave_phase_out)
   |
   v
-GPU: D3D11 vertex buffer update + shading
+GPU: D3D11 vertex buffer update + pixel shading
 ```
 
 ## Tested hardware
@@ -108,6 +111,10 @@ GPU: D3D11 vertex buffer update + shading
 |-----|-----|--------|
 | Intel Core Ultra 9 285HX | Intel AI Boost (Arrow Lake) | 30 FPS |
 | Intel Core Ultra 7 256V | Intel AI Boost (Lunar Lake) | 30 FPS |
+
+## Keywords
+
+Intel NPU, Neural Processing Unit, Intel AI Boost, OpenVINO, OpenVINO C++ API, ONNX, FP16 inference, Intel Core Ultra, Arrow Lake, Lunar Lake, Meteor Lake, NPU programming, non-AI NPU workload, general-purpose NPU compute, tensor graph, hardware acceleration, NPU co-processor, D3D11, real-time simulation
 
 ## License
 

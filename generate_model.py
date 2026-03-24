@@ -210,6 +210,10 @@ def create_model(output_path: str):
     ball_cutoff_15 = np.array([[[[1.5]]]], dtype=np.float16)   # matches CPU `dist2 > R*R*1.5f`
     ball_pt4 = np.array([[[[0.4]]]], dtype=np.float16)          # matches CPU `speed / (radius * 0.4)`
 
+    # Ripple amplitude clamp — prevents blowup on FP32 devices (CPU)
+    ripple_clip_min = np.array([-10.0], dtype=np.float16)
+    ripple_clip_max = np.array([10.0], dtype=np.float16)
+
     initializers = [
         numpy_helper.from_array(ripple_k, "ripple_kernel"),
         numpy_helper.from_array(ddx_w,    "ddx_w"),
@@ -248,6 +252,8 @@ def create_model(output_path: str):
         numpy_helper.from_array(bounce_1p5, "bounce_1p5"),
         numpy_helper.from_array(ball_cutoff_15, "ball_cutoff_15"),
         numpy_helper.from_array(ball_pt4, "ball_pt4"),
+        numpy_helper.from_array(ripple_clip_min, "ripple_clip_min"),
+        numpy_helper.from_array(ripple_clip_max, "ripple_clip_max"),
     ]
 
     # Precompute per-wave constants — packed into batch tensors
@@ -485,9 +491,12 @@ def create_model(output_path: str):
         nodes.append(helper.make_node(
             "Mul", [f"rraw{s}", "damping"], [f"rdamp{s}"]))
         # Sponge boundary
+        nodes.append(helper.make_node(
+            "Mul", [f"rdamp{s}", "sponge_mask"], [f"rsponge{s}"]))
+        # Clamp amplitude — safety net for FP32 devices (CPU)
         rh_out = f"rh_{step + 1}"
         nodes.append(helper.make_node(
-            "Mul", [f"rdamp{s}", "sponge_mask"], [rh_out]))
+            "Clip", [f"rsponge{s}", "ripple_clip_min", "ripple_clip_max"], [rh_out]))
         # Shift history
         rhp_out = f"rhp_{step + 1}"
         nodes.append(helper.make_node("Identity", [rh], [rhp_out]))
