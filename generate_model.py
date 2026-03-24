@@ -183,8 +183,8 @@ def create_model(output_path: str):
     # Drag as exponential decay: drag_per_frame = exp(-decay_rate * dt)
     # At 30fps: 0.92 = exp(-rate * 0.033) → rate = -ln(0.92)/0.033 ≈ 2.53
     duck_decay_rate = np.array([[[[math.log(0.92) / 0.033]]]], dtype=np.float16)  # negative → exp(neg*dt) < 1
-    duck_pos_min = np.array([-83.0], dtype=np.float16)
-    duck_pos_max = np.array([83.0], dtype=np.float16)
+    duck_pos_min = np.array([-110.0], dtype=np.float16)  # GRID/2 - DUCK_R = 128 - 18
+    duck_pos_max = np.array([110.0], dtype=np.float16)
 
     # --- Duck hull displacement + wake (NPU, full 256x256 tensor ops) ---
     DUCK_R = 45.0 * 0.4   # waterline footprint radius (DUCK_SCALE * 0.4)
@@ -200,8 +200,9 @@ def create_model(output_path: str):
     wake_neg_inv_rw = np.array([[[[-1.0 / 0.12]]]], dtype=np.float16)
     wake_strength = np.array([[[[0.03]]]], dtype=np.float16)  # per second (scaled by dt)
 
-    # Duck slope sampling: wide Gaussian (σ²=64) — mean(w)≈0.006, FP16-safe
-    sample_neg_inv_s2 = np.array([[[[-1.0 / 128.0]]]], dtype=np.float16)  # -1/(2×64)
+    # Duck slope sampling: Gaussian (σ²=4, σ=2 cells) — mean(w)≈3.8e-4, FP16-safe
+    sample_neg_inv_s2 = np.array([[[[-0.125]]]], dtype=np.float16)  # -1/(2×4)
+    slope_prescale = np.array([[[[512.0]]]], dtype=np.float16)       # prevent numerator underflow
     # Duck wall bounce: factor = 1.0 - 1.5 × hit → -0.5 on wall hit
     bounce_1p5 = np.array([[[[1.5]]]], dtype=np.float16)
 
@@ -243,6 +244,7 @@ def create_model(output_path: str):
         numpy_helper.from_array(wake_neg_inv_rw, "wake_neg_inv_rw"),
         numpy_helper.from_array(wake_strength, "wake_strength"),
         numpy_helper.from_array(sample_neg_inv_s2, "sample_neg_inv_s2"),
+        numpy_helper.from_array(slope_prescale, "slope_prescale"),
         numpy_helper.from_array(bounce_1p5, "bounce_1p5"),
         numpy_helper.from_array(ball_cutoff_15, "ball_cutoff_15"),
         numpy_helper.from_array(ball_pt4, "ball_pt4"),
@@ -543,20 +545,27 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Mul", ["refract_base_z", "sec_theta"], ["refract_z"]))
 
     # ================================================================
-    # DUCK SLOPE SAMPLING — wide Gaussian weighted average (σ²=64, FP16-safe)
-    # mean(w)≈0.006 — well above FP16 min normal (6e-5)
+    # DUCK SLOPE SAMPLING — Gaussian weighted average (σ²=4, σ=2 cells)
+    # Pre-scale slopes ×512 to prevent FP16 underflow in GlobalAveragePool
+    # (mean(w·slope)/N² ≈ 6.9e-6 without prescale — below FP16 min normal)
     # Reuses hull_dist2 from hull displacement section
     # ================================================================
     nodes.append(helper.make_node("Mul", ["hull_dist2", "sample_neg_inv_s2"], ["sample_exp_arg"]))
     nodes.append(helper.make_node("Exp", ["sample_exp_arg"], ["sample_w"]))
-    nodes.append(helper.make_node("Mul", ["sample_w", "dhdx_sc"], ["sample_wx"]))
-    nodes.append(helper.make_node("Mul", ["sample_w", "dhdy_sc"], ["sample_wz"]))
+    # Pre-scale slopes to keep numerator above FP16 min normal
+    nodes.append(helper.make_node("Mul", ["dhdx_sc", "slope_prescale"], ["dhdx_big"]))
+    nodes.append(helper.make_node("Mul", ["dhdy_sc", "slope_prescale"], ["dhdy_big"]))
+    nodes.append(helper.make_node("Mul", ["sample_w", "dhdx_big"], ["sample_wx"]))
+    nodes.append(helper.make_node("Mul", ["sample_w", "dhdy_big"], ["sample_wz"]))
     nodes.append(helper.make_node("GlobalAveragePool", ["sample_wx"], ["slope_x_mean"]))
     nodes.append(helper.make_node("GlobalAveragePool", ["sample_wz"], ["slope_z_mean"]))
     nodes.append(helper.make_node("GlobalAveragePool", ["sample_w"], ["w_mean"]))
     nodes.append(helper.make_node("Add", ["w_mean", "wake_epsilon2"], ["w_mean_safe"]))
-    nodes.append(helper.make_node("Div", ["slope_x_mean", "w_mean_safe"], ["dk_slope_x"]))
-    nodes.append(helper.make_node("Div", ["slope_z_mean", "w_mean_safe"], ["dk_slope_z"]))
+    # Divide and undo prescale
+    nodes.append(helper.make_node("Div", ["slope_x_mean", "w_mean_safe"], ["dk_slope_x_big"]))
+    nodes.append(helper.make_node("Div", ["slope_z_mean", "w_mean_safe"], ["dk_slope_z_big"]))
+    nodes.append(helper.make_node("Div", ["dk_slope_x_big", "slope_prescale"], ["dk_slope_x"]))
+    nodes.append(helper.make_node("Div", ["dk_slope_z_big", "slope_prescale"], ["dk_slope_z"]))
 
     # ================================================================
     # DUCK PHYSICS — free-floating rubber duck on NPU (dt-scaled)
