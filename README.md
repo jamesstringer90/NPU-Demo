@@ -2,6 +2,8 @@
 
 A proof-of-concept demonstrating the Intel NPU as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the NPU via OpenVINO. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
+**There is no neural network here.** The ONNX graph contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as 208 tensor operations. The NPU doesn't know it's not running a neural network. This treats ONNX as a "compute shader" for the NPU, showing that any computation expressible as a tensor graph can run on hardware that the industry markets exclusively for AI inference.
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
 ![D3D11](https://img.shields.io/badge/GPU-D3D11-orange)
