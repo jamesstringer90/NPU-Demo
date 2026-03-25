@@ -2,7 +2,7 @@
 
 A proof-of-concept demonstrating the Intel NPU (Neural Processing Unit) as a general-purpose co-processor for real-time "simulation" workloads. A single FP16 ONNX inference call per frame computes all physics (water waves, ripples, duck movement, caustics, refraction) entirely on the Intel AI Boost NPU via the OpenVINO C++ inference API. The CPU only copies data and builds vertex buffers, the GPU handles shading.
 
-**There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as a 216-node tensor graph running at FP16 precision. The NPU doesn't know it's not running a neural network; it just sees tensor operations.
+**There is no neural network here.** The ONNX model contains zero learned weights — it's a hand-authored physics simulation (Gerstner waves, Verlet integration, Newtonian mechanics, Snell's law) expressed as a 283-node tensor graph running at FP16 precision. The NPU doesn't know it's not running a neural network; it just sees tensor operations.
 
 I'm not a game developer and I have no background in simulation — I just wanted to see if the NPU could do something other than AI. Turns out it can.
 
@@ -18,18 +18,19 @@ Everything below executes as a single OpenVINO inference request on the Intel NP
 
 - **32 Gerstner waves** — Phillips spectrum with deep-water dispersion, packed into batch tensors
 - **Interactive ripple layer** — 8-substep Verlet wave equation with damping
-- **Duck physics** — hull displacement, directional wake injection, Newtonian drift, slope sampling, wall bounce
+- **Duck physics** — hull displacement, directional wake, bow wave, Newtonian drift, slope sampling, wall bounce, ball-duck collision, buoyancy bob, tilt smoothing
 - **Ball splash** — directional ring impulse with path interpolation scaling
 - **Caustics** — Laplacian convolution with Gaussian pre-smoothing
 - **Refraction** — Snell's law with view-angle correction (per-cell sec(theta))
 - **Surface normals** — finite-difference derivatives for lighting
 
-All 216 ONNX nodes execute in a single synchronous `infer()` call at FP16 precision on the NPU device.
+All 283 ONNX nodes execute in a single synchronous `infer()` call at FP16 precision on the NPU device.
 
 ## Controls
 
 | Input | Action |
 |-------|--------|
+| Left-click | Splash at cursor position |
 | Left-click drag | Drag ball through water |
 | Right-click drag | Rotate camera |
 | Scroll wheel | Zoom in/out |
@@ -89,14 +90,17 @@ npu_water_sim.vcxproj      VS2022 project (copies DLLs + model on build)
 ### Data flow per frame
 
 ```
-CPU: pack inputs (state, wave_phase, camera, duck, ball, dt)
+CPU: pack inputs (state, wave_phase, camera, duck, dt, ball, splash)
   |
   v
-NPU: single OpenVINO infer() call (216 ONNX nodes, FP16)
+NPU: single OpenVINO infer() call (283 ONNX nodes, FP16)
   |   - Gerstner wave synthesis (batch Sin + 1x1 Conv)
   |   - Ripple propagation (8× Verlet substeps)
-  |   - Hull displacement + wake injection
+  |   - Hull displacement + wake + bow wave
   |   - Ball splash (ring impulse + facing dot)
+  |   - Click/spacebar splash (Gaussian impulse)
+  |   - Ball-duck collision (branchless overlap + push)
+  |   - Duck buoyancy + tilt smoothing
   |   - Duck slope sampling + Newtonian physics + wall bounce
   |   - Caustics + refraction + surface normals
   |

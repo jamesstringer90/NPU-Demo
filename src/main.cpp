@@ -4,17 +4,18 @@
  * Gerstner wave ocean synthesis on the Intel NPU via OpenVINO.
  * A single NPU inference call per frame performs:
  *   - 32 Gerstner waves with Phillips spectrum + deep-water dispersion
- *   - 8-step interactive ripple layer (for ball/splash interaction)
+ *   - 8-step interactive ripple layer (for duck/splash interaction)
  *   - Render output: scaled heights + surface derivatives for normals/choppiness
  *
  * The CPU only copies data in/out and builds the vertex buffer.
  * The GPU handles shading via D3D11.
  *
  * Controls:
- *   Left-drag   = drag ball through water
+ *   Left-drag   = grab and drag a duck through water
  *   Space       = splash at center
  *   R           = reset simulation
  *   T           = toggle tuning slider panel
+ *   F           = toggle Bubble Bath mode
  *   Escape      = quit
  */
 
@@ -51,25 +52,27 @@ static constexpr int   WIN_H    = 720;
 // Runtime-adjustable parameters (controlled by on-screen sliders)
 // Defaults tuned for gentle Sea-of-Thieves-style ocean (model HEIGHT_SCALE=3)
 static float g_normalY      = 0.5f;
-static float g_chopScale    = 4.675f;
+static float g_chopScale    = 3.815f;
 static float g_heightScale  = 2.06f;
 static float g_fresnelPow   = 1.0f;
-static float g_fresnelMin   = 0.049f;
-static float g_fresnelMax   = 0.602f;
-static float g_specPow      = 500.0f;
-static float g_specStr      = 1.366f;
+static float g_fresnelMin   = 0.107f;
+static float g_fresnelMax   = 0.595f;
+static float g_specPow      = 10.0f;
+static float g_specStr      = 1.826f;
 static float g_camDist      = 1.267f;   // fraction of GRID
 static float g_camHeight    = 0.575f;   // fraction of GRID
 static float g_camSpeed     = 0.0f;
 static float g_camAngle     = 0.0f;     // manual orbit angle (radians)
+static float g_foamThreshold = 0.028f;  // minimum foam density to display
+static float g_foamCoarseness = 0.0f;   // noise scale for organic foam breakup
+static float g_foamDecay = 0.971f;      // foam decay per frame
+static float g_foamGeneration = 0.083f; // foam particles generated when threshold met
+static float g_foamOpacity = 4.395f;    // foam transparency curve (higher = more opaque)
+static bool  g_foamEnabled  = false;    // F key toggles Bubble Bath mode
 static bool  g_rDragging    = false;    // right-click drag active
 static float g_rDragStartX  = 0.0f;    // mouse X at right-click start
 static float g_rDragStartAngle = 0.0f; // camAngle at right-click start
 
-// Ball interaction
-static float g_ballRadius   = 15.62f;
-static float g_ballDepth    = 0.15f;
-static float g_ballMovePush = 0.03f;
 
 // ---------------------------------------------------------------------------
 // Vertex layout
@@ -77,6 +80,7 @@ static float g_ballMovePush = 0.03f;
 struct Vertex {
     XMFLOAT3 pos;
     XMFLOAT3 nrm;
+    float    foam;   // sea foam intensity [0..1] — white foam at wave crests + wakes
 };
 
 // ---------------------------------------------------------------------------
@@ -88,7 +92,7 @@ struct alignas(16) CB {
     XMFLOAT3   lightDir; float _0; // 16 bytes
     XMFLOAT3   eye;      float _1; // 16 bytes
     float      time;     float fresnelPow; float fresnelMin; float fresnelMax; // 16 bytes
-    float      specPow;  float specStr;    float _3[2]; // 16 bytes  (total: 192)
+    float      specPow;  float specStr;    float foamOpacity; float _3; // 16 bytes  (total: 192)
 };
 
 // ---------------------------------------------------------------------------
@@ -101,15 +105,16 @@ cbuffer CB : register(b0) {
     float3   lightDir; float _0;
     float3   eye;      float _1;
     float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
+    float    specPow;  float specStr;    float foamOpacity; float _3;
 };
-struct I { float3 p : POSITION; float3 n : NORMAL; };
-struct O { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
+struct I { float3 p : POSITION; float3 n : NORMAL; float foam : FOAM; };
+struct O { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; float foam : TEXCOORD1; };
 O main(I i) {
     O o;
     o.wp = mul(float4(i.p, 1), world).xyz;
     o.sv = mul(float4(i.p, 1), wvp);
     o.n  = mul(float4(i.n, 0), world).xyz;
+    o.foam = i.foam;
     return o;
 }
 )";
@@ -123,7 +128,7 @@ cbuffer CB : register(b0) {
     float3   lightDir; float _0;
     float3   eye;      float _1;
     float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
+    float    specPow;  float specStr;    float foamOpacity; float _3;
 };
 
 float3 getSkyColor(float3 e) {
@@ -131,7 +136,7 @@ float3 getSkyColor(float3 e) {
     return float3(pow(1.0 - e.y, 2.0), 1.0 - e.y, 0.6 + (1.0 - e.y) * 0.4) * 1.1;
 }
 
-struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
+struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; float foam : TEXCOORD1; };
 
 float4 main(I i) : SV_TARGET {
     float3 N = normalize(i.n);
@@ -166,37 +171,30 @@ float4 main(I i) : SV_TARGET {
     float h = i.wp.y;
     color += seaWater * saturate(h * 0.02) * 0.15;
 
+    // Sea foam — NPU-simulated bubble layer
+    // foamOpacity controls transparency: thin foam fades, thick foam stays opaque
+    float foamAmt = saturate(i.foam * foamOpacity);
+
+    float foamDiffuse = saturate(dot(N, L));
+    float foamHalf    = foamDiffuse * 0.6 + 0.4;
+    float3 foamLit    = float3(0.95, 0.97, 1.0) * foamHalf;
+    float3 foamShadow = float3(0.55, 0.62, 0.72);
+    float3 foamColor  = lerp(foamShadow, foamLit, foamDiffuse * 0.7 + 0.3);
+    float foamSpec = pow(NdotH, 80.0) * 1.5;
+    foamColor += float3(1.0, 1.0, 1.0) * foamSpec;
+
+    color = lerp(color, foamColor, foamAmt);
+
+    // Gamma correction
     color = pow(saturate(color), 0.65);
 
-    // Bath water transparency — clear with slight blue tint
     float alpha = saturate(fresnel + 0.25);
+    alpha = lerp(alpha, 1.0, foamAmt);
 
     return float4(color, alpha);
 }
 )";
 
-// Ball pixel shader — dark translucent sphere
-static const char* g_ballPsSource = R"(
-cbuffer CB : register(b0) {
-    float4x4 wvp;
-    float4x4 world;
-    float3   lightDir; float _0;
-    float3   eye;      float _1;
-    float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
-};
-struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
-float4 main(I i) : SV_TARGET {
-    float3 N = normalize(i.n);
-    float3 L = normalize(lightDir);
-    float3 V = normalize(eye - i.wp);
-    float NdotL = saturate(dot(N, L) * 0.5 + 0.5);
-    float3 H = normalize(L + V);
-    float spec = pow(max(dot(N, H), 0.0), 80.0) * 0.5;
-    float3 color = float3(0.15, 0.15, 0.18) * NdotL + spec;
-    return float4(color, 1.0);
-}
-)";
 
 // Tile floor pixel shader — blue tiles + white grout + NPU-computed caustics
 static const char* g_tilePsSource = R"(
@@ -208,7 +206,7 @@ cbuffer CB : register(b0) {
     float3   lightDir; float _0;
     float3   eye;      float _1;
     float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
+    float    specPow;  float specStr;    float foamOpacity; float _3;
 };
 struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
 float4 main(I i) : SV_TARGET {
@@ -251,7 +249,7 @@ cbuffer CB : register(b0) {
     float3   lightDir; float _0;
     float3   eye;      float _1;
     float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
+    float    specPow;  float specStr;    float foamOpacity; float _3;
 };
 struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
 float4 main(I i) : SV_TARGET {
@@ -279,7 +277,7 @@ cbuffer CB : register(b0) {
     float3   lightDir; float _0;
     float3   eye;      float _1;
     float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
-    float    specPow;  float specStr;    float _3[2];
+    float    specPow;  float specStr;    float foamOpacity; float _3;
 };
 struct I { float4 sv : SV_POSITION; float3 n : NORMAL; float3 wp : TEXCOORD0; };
 float4 main(I i) : SV_TARGET {
@@ -294,6 +292,7 @@ float4 main(I i) : SV_TARGET {
     return float4(color, 1.0);
 }
 )";
+
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -313,11 +312,6 @@ static ID3D11PixelShader*      g_ps     = nullptr;
 static ID3D11RasterizerState*  g_rs     = nullptr;
 static ID3D11BlendState*       g_blend  = nullptr;
 
-// Ball rendering
-static ID3D11Buffer*           g_ballVB  = nullptr;
-static ID3D11Buffer*           g_ballIB  = nullptr;
-static ID3D11PixelShader*      g_ballPS  = nullptr;
-static UINT                    g_ballNumIdx = 0;
 
 // Tile floor
 static ID3D11Buffer*           g_tileVB  = nullptr;
@@ -339,16 +333,24 @@ static ID3D11PixelShader*      g_billPS  = nullptr;
 static UINT                    g_duckBodyNumIdx = 0;
 static UINT                    g_duckBillStart  = 0;
 static UINT                    g_duckBillNumIdx = 0;
+// Duck 1
 static float g_duckX = 30.0f, g_duckZ = -20.0f, g_duckY = 0.0f;
-static float g_duckVX = 0.0f, g_duckVZ = 0.0f;  // velocity for free-floating drift
+static float g_duckVX = 0.0f, g_duckVZ = 0.0f;
 static float g_duckPrevX = 30.0f, g_duckPrevZ = -20.0f;
-static float g_duckTiltX = 0.0f, g_duckTiltZ = 0.0f;  // smoothed slope for orientation
+static float g_duckTiltX = 0.0f, g_duckTiltZ = 0.0f;
+// Duck 2
+static float g_duck2X = -30.0f, g_duck2Z = 20.0f, g_duck2Y = 0.0f;
+static float g_duck2VX = 0.0f, g_duck2VZ = 0.0f;
+static float g_duck2PrevX = -30.0f, g_duck2PrevZ = 20.0f;
+static float g_duck2TiltX = 0.0f, g_duck2TiltZ = 0.0f;
 static constexpr float DUCK_SCALE = 45.0f;
+// Mouse drag state
+static int   g_draggedDuck = -1;  // -1 = none, 0 = duck1, 1 = duck2
 
 static ov::InferRequest             g_infer;
 static std::vector<ov::float16>     g_state;      // [2 * GRID * GRID] — h_cur + h_prev
 static std::vector<ov::float16>     g_wavePhase;  // [32] — per-wave wrapped omega*time (maintained on NPU)
-static std::vector<ov::float16>     g_renderBuf;  // [6 * GRID * GRID] — NPU render output (h, dhdx, dhdz, caustic, refract_x, refract_z)
+static std::vector<ov::float16>     g_renderBuf;  // [10 * GRID * GRID] — NPU render output (pos_x, pos_y, pos_z, nrm_x, nrm_y, nrm_z, caustic, refract_x, refract_z, foam)
 static std::vector<Vertex>          g_verts;       // [GRID * GRID]
 static UINT                         g_numIdx = 0;
 
@@ -358,13 +360,6 @@ static float    g_dt      = 0.033f;  // frame delta time (passed to NPU for rate
 static bool     g_running = true;
 static std::string g_device = "NPU";  // OpenVINO device: "NPU" or "CPU"
 static std::mt19937 g_rng{42};
-
-// Ball state
-static float g_ballX     = 0.0f;
-static float g_ballZ     = 0.0f;
-static float g_ballPrevX = 0.0f;
-static float g_ballPrevZ = 0.0f;
-static bool  g_dragging  = false;
 
 // Splash state (consumed by NPU each frame, then cleared)
 static float g_splashX      = 0.0f;
@@ -400,8 +395,11 @@ static Slider g_sliders[] = {
     {"Cam Distance",  &g_camDist,      0.3f,   2.0f, nullptr, nullptr, nullptr, 108},
     {"Cam Height",    &g_camHeight,    0.05f,  1.0f, nullptr, nullptr, nullptr, 109},
     {"Cam Speed",     &g_camSpeed,     0.0f,   1.0f, nullptr, nullptr, nullptr, 110},
-    {"Ball Radius",   &g_ballRadius,   5.0f,  50.0f, nullptr, nullptr, nullptr, 111},
-    {"Ball Wake",     &g_ballMovePush, 0.0f,   0.3f, nullptr, nullptr, nullptr, 113},
+    {"Foam Threshold",&g_foamThreshold,0.0f,   0.3f, nullptr, nullptr, nullptr, 111},
+    {"Foam Size",     &g_foamCoarseness,0.0f, 1.0f, nullptr, nullptr, nullptr, 112},
+    {"Foam Decay",    &g_foamDecay,    0.95f, 0.999f, nullptr, nullptr, nullptr, 113},
+    {"Foam Amount",   &g_foamGeneration,0.0f, 0.15f, nullptr, nullptr, nullptr, 114},
+    {"Foam Opacity",  &g_foamOpacity,  0.5f, 10.0f, nullptr, nullptr, nullptr, 115},
 };
 static constexpr int NUM_SLIDERS = sizeof(g_sliders) / sizeof(g_sliders[0]);
 
@@ -451,8 +449,10 @@ static void createSliderPanel(HINSTANCE hInst) {
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
 
-    int panelW = 310, rowH = 28;
-    int panelH = NUM_SLIDERS * rowH + 10;
+    int panelW = 400, rowH = 28;
+    RECT rc = {0, 0, panelW, NUM_SLIDERS * rowH + 10};
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    int panelH = rc.bottom - rc.top;
 
     g_panelHwnd = CreateWindowW(
         L"NPUPanel", L"Tuning",
@@ -466,18 +466,18 @@ static void createSliderPanel(HINSTANCE hInst) {
 
         s.labelHwnd = CreateWindowA("STATIC", s.label,
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            4, y + 2, 90, 20, g_panelHwnd, nullptr, hInst, nullptr);
+            4, y + 2, 120, 20, g_panelHwnd, nullptr, hInst, nullptr);
 
         s.track = CreateWindowW(TRACKBAR_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
-            96, y, 150, 22, g_panelHwnd,
+            126, y, 200, 22, g_panelHwnd,
             reinterpret_cast<HMENU>(static_cast<intptr_t>(s.id)), hInst, nullptr);
         SendMessageW(s.track, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
         SendMessageW(s.track, TBM_SETPOS, TRUE, valueToSlider(s));
 
         s.valHwnd = CreateWindowA("STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            250, y + 2, 55, 20, g_panelHwnd, nullptr, hInst, nullptr);
+            330, y + 2, 55, 20, g_panelHwnd, nullptr, hInst, nullptr);
         updateSliderLabel(s);
     }
 }
@@ -491,8 +491,6 @@ static void createSliderPanel(HINSTANCE hInst) {
     ExitProcess(1);
 }
 
-// Splash is now computed on NPU — see splash section in generate_model.py
-// CPU packs splash_in = (x, z, radius, height) in runSimulation()
 
 // ---------------------------------------------------------------------------
 // Reset simulation state
@@ -525,8 +523,6 @@ static bool mouseToWaterPlane(float mx, float my, float& outX, float& outZ) {
     return true;
 }
 
-// Ball splash is now computed on NPU — see ball wake section in generate_model.py
-// CPU packs ball_in = (x, z, vx, vz, radius, push) in runSimulation()
 
 // ---------------------------------------------------------------------------
 // Initialize D3D11
@@ -635,17 +631,14 @@ static void initShaders() {
     D3D11_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"FOAM",     0, DXGI_FORMAT_R32_FLOAT,       0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
-    g_dev->CreateInputLayout(layout, 2, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_il);
+    g_dev->CreateInputLayout(layout, 3, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_il);
     vsBlob->Release();
 
     ID3DBlob* psBlob = compile(g_psSource, "ps_5_0", "main");
     g_dev->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_ps);
     psBlob->Release();
-
-    ID3DBlob* ballBlob = compile(g_ballPsSource, "ps_5_0", "main");
-    g_dev->CreatePixelShader(ballBlob->GetBufferPointer(), ballBlob->GetBufferSize(), nullptr, &g_ballPS);
-    ballBlob->Release();
 
     ID3DBlob* duckBlob = compile(g_duckPsSource, "ps_5_0", "main");
     g_dev->CreatePixelShader(duckBlob->GetBufferPointer(), duckBlob->GetBufferSize(), nullptr, &g_duckPS);
@@ -708,46 +701,6 @@ static void initMesh() {
     cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     g_dev->CreateBuffer(&cbd, nullptr, &g_cb);
-
-    // --- Ball sphere mesh (unit sphere, scaled at draw time) ---
-    const int SLICES = 24, STACKS = 16;
-    std::vector<Vertex> ballVerts;
-    std::vector<uint32_t> ballIdx;
-    ballVerts.reserve((STACKS + 1) * (SLICES + 1));
-    for (int st = 0; st <= STACKS; st++) {
-        float phi = XM_PI * st / STACKS;
-        float sp = sinf(phi), cp = cosf(phi);
-        for (int sl = 0; sl <= SLICES; sl++) {
-            float theta = 2.0f * XM_PI * sl / SLICES;
-            float x = sp * cosf(theta);
-            float y = cp;
-            float z = sp * sinf(theta);
-            ballVerts.push_back({{x, y, z}, {x, y, z}});
-        }
-    }
-    for (int st = 0; st < STACKS; st++) {
-        for (int sl = 0; sl < SLICES; sl++) {
-            uint32_t a = st * (SLICES + 1) + sl;
-            uint32_t b = a + SLICES + 1;
-            ballIdx.push_back(a); ballIdx.push_back(b);     ballIdx.push_back(a + 1);
-            ballIdx.push_back(a + 1); ballIdx.push_back(b); ballIdx.push_back(b + 1);
-        }
-    }
-    g_ballNumIdx = static_cast<UINT>(ballIdx.size());
-
-    D3D11_BUFFER_DESC bvbd{};
-    bvbd.ByteWidth = static_cast<UINT>(ballVerts.size() * sizeof(Vertex));
-    bvbd.Usage     = D3D11_USAGE_DEFAULT;
-    bvbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA bvsd{ballVerts.data()};
-    g_dev->CreateBuffer(&bvbd, &bvsd, &g_ballVB);
-
-    D3D11_BUFFER_DESC bibd{};
-    bibd.ByteWidth = static_cast<UINT>(ballIdx.size() * sizeof(uint32_t));
-    bibd.Usage     = D3D11_USAGE_DEFAULT;
-    bibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA bisd{ballIdx.data()};
-    g_dev->CreateBuffer(&bibd, &bisd, &g_ballIB);
 
     // --- Rubber duck from STL file ---
     {
@@ -915,9 +868,9 @@ static void initOpenVINO() {
         auto compiled = core.compile_model(model, g_device);
         g_infer = compiled.create_infer_request();
 
-        g_state.resize(2 * GRID * GRID, ov::float16(0.0f));
+        g_state.resize(4 * GRID * GRID, ov::float16(0.0f));
         g_wavePhase.resize(N_WAVES, ov::float16(0.0f));
-        g_renderBuf.resize(6 * GRID * GRID, ov::float16(0.0f));
+        g_renderBuf.resize(10 * GRID * GRID, ov::float16(0.0f));
         resetState();
 
         printf("Ocean engine ready on %s.\n", g_device.c_str());
@@ -978,24 +931,16 @@ static void runSimulation() {
     auto dtTensor = g_infer.get_input_tensor(4);
     dtTensor.data<ov::float16>()[0] = ov::float16(g_dt);
 
-    // Input 5: ball state [1, 7, 1, 1] = (x, z, vx, vz, radius, push, active)
-    // Uses midpoint of prev→current for better coverage on fast drags
-    auto ballTensor = g_infer.get_input_tensor(5);
-    auto* ballData = ballTensor.data<ov::float16>();
-    float bvx = g_ballX - g_ballPrevX;
-    float bvz = g_ballZ - g_ballPrevZ;
-    float bspeed = sqrtf(bvx * bvx + bvz * bvz);
-    float bmidX = (g_ballX + g_ballPrevX) * 0.5f;
-    float bmidZ = (g_ballZ + g_ballPrevZ) * 0.5f;
-    ballData[0] = ov::float16(bmidX);
-    ballData[1] = ov::float16(bmidZ);
-    ballData[2] = ov::float16(bvx);
-    ballData[3] = ov::float16(bvz);
-    ballData[4] = ov::float16(g_ballRadius);
-    ballData[5] = ov::float16((g_dragging && bspeed >= 0.1f) ? g_ballMovePush : 0.0f);
-    ballData[6] = ov::float16(g_dragging ? 1.0f : 0.0f);
-    g_ballPrevX = g_ballX;
-    g_ballPrevZ = g_ballZ;
+    // Input 5: duck2 state [1, 7, 1, 1] = (x, z, vx, vz, y, tiltX, tiltZ)
+    auto duck2Tensor = g_infer.get_input_tensor(5);
+    auto* duck2In = duck2Tensor.data<ov::float16>();
+    duck2In[0] = ov::float16(g_duck2X);
+    duck2In[1] = ov::float16(g_duck2Z);
+    duck2In[2] = ov::float16(g_duck2VX);
+    duck2In[3] = ov::float16(g_duck2VZ);
+    duck2In[4] = ov::float16(g_duck2Y);
+    duck2In[5] = ov::float16(g_duck2TiltX);
+    duck2In[6] = ov::float16(g_duck2TiltZ);
 
     // Input 6: splash [1, 4, 1, 1] = (x, z, radius, height) — height=0 when idle
     auto splashTensor = g_infer.get_input_tensor(6);
@@ -1006,6 +951,21 @@ static void runSimulation() {
     splashData[3] = ov::float16(g_splashHeight);
     g_splashHeight = 0.0f;  // one-shot: clear after packing
 
+    // Input 7: foam params [1, 2, 1, 1] = (threshold, coarseness)
+    auto foamParamsTensor = g_infer.get_input_tensor(7);
+    auto* foamParamsData = foamParamsTensor.data<ov::float16>();
+    foamParamsData[0] = ov::float16(g_foamThreshold);
+    foamParamsData[1] = ov::float16(g_foamCoarseness);
+    foamParamsData[2] = ov::float16(g_foamEnabled ? g_foamDecay : 0.0f);
+    foamParamsData[3] = ov::float16(g_foamEnabled ? g_foamGeneration : 0.0f);
+
+    // Input 8: render params [1, 3, 1, 1] = (chopScale, heightScale, normalY)
+    auto renderParamsTensor = g_infer.get_input_tensor(8);
+    auto* renderParamsData = renderParamsTensor.data<ov::float16>();
+    renderParamsData[0] = ov::float16(g_chopScale);
+    renderParamsData[1] = ov::float16(g_heightScale);
+    renderParamsData[2] = ov::float16(g_normalY);
+
     // Single inference: waves + ripples + caustics + refraction + duck + ball + splash
     g_infer.infer();
 
@@ -1015,28 +975,66 @@ static void runSimulation() {
            g_state.size() * sizeof(ov::float16));
 
 
-    // Output 1: render data (h, dhdx, dhdz, caustic, refract_x, refract_z)
+    // Output 1: render data (h, dhdx, dhdz, caustic, refract_x, refract_z, foam)
     auto renderOut = g_infer.get_output_tensor(1);
     memcpy(g_renderBuf.data(), renderOut.data<ov::float16>(),
            g_renderBuf.size() * sizeof(ov::float16));
 
-    // Output 2: duck state (x, z, vx, vz) — NPU-computed free-floating physics
+    // Output 2: duck1 state (x, z, vx, vz, y, tiltX, tiltZ)
     auto duckOut = g_infer.get_output_tensor(2);
     auto* duckResult = duckOut.data<ov::float16>();
 
-    // Output 3: updated wave phases (NPU-maintained, wrapped [-π,π))
-    auto wavePhaseOut = g_infer.get_output_tensor(3);
+    // Output 3: duck2 state
+    auto duck2Out = g_infer.get_output_tensor(3);
+    auto* duck2Result = duck2Out.data<ov::float16>();
+
+    // Output 4: updated wave phases (NPU-maintained, wrapped [-π,π))
+    auto wavePhaseOut = g_infer.get_output_tensor(4);
     memcpy(g_wavePhase.data(), wavePhaseOut.data<ov::float16>(),
            N_WAVES * sizeof(ov::float16));
-    g_duckPrevX = g_duckX;
-    g_duckPrevZ = g_duckZ;
-    g_duckX     = float(duckResult[0]);
-    g_duckZ     = float(duckResult[1]);
-    g_duckVX    = float(duckResult[2]);
-    g_duckVZ    = float(duckResult[3]);
-    g_duckY     = float(duckResult[4]);
-    g_duckTiltX = float(duckResult[5]);
-    g_duckTiltZ = float(duckResult[6]);
+
+    // Duck1: if dragged, keep mouse position; otherwise take NPU output
+    if (g_draggedDuck == 0) {
+        g_duckVX    = (g_duckX - g_duckPrevX) / g_dt;
+        g_duckVZ    = (g_duckZ - g_duckPrevZ) / g_dt;
+        g_duckPrevX = g_duckX;
+        g_duckPrevZ = g_duckZ;
+        g_duckY     = float(duckResult[4]);
+        g_duckTiltX = float(duckResult[5]);
+        g_duckTiltZ = float(duckResult[6]);
+    } else {
+        g_duckPrevX = g_duckX;
+        g_duckPrevZ = g_duckZ;
+        g_duckX     = float(duckResult[0]);
+        g_duckZ     = float(duckResult[1]);
+        g_duckVX    = float(duckResult[2]);
+        g_duckVZ    = float(duckResult[3]);
+        g_duckY     = float(duckResult[4]);
+        g_duckTiltX = float(duckResult[5]);
+        g_duckTiltZ = float(duckResult[6]);
+    }
+
+    // Duck2: same pattern
+    if (g_draggedDuck == 1) {
+        g_duck2VX    = (g_duck2X - g_duck2PrevX) / g_dt;
+        g_duck2VZ    = (g_duck2Z - g_duck2PrevZ) / g_dt;
+        g_duck2PrevX = g_duck2X;
+        g_duck2PrevZ = g_duck2Z;
+        g_duck2Y     = float(duck2Result[4]);
+        g_duck2TiltX = float(duck2Result[5]);
+        g_duck2TiltZ = float(duck2Result[6]);
+    } else {
+        g_duck2PrevX = g_duck2X;
+        g_duck2PrevZ = g_duck2Z;
+        g_duck2X     = float(duck2Result[0]);
+        g_duck2Z     = float(duck2Result[1]);
+        g_duck2VX    = float(duck2Result[2]);
+        g_duck2VZ    = float(duck2Result[3]);
+        g_duck2Y     = float(duck2Result[4]);
+        g_duck2TiltX = float(duck2Result[5]);
+        g_duck2TiltZ = float(duck2Result[6]);
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,27 +1044,20 @@ static void updateMesh() {
     const int N  = GRID;
     const int NN = N * N;
 
-    // NPU render output layout: [1, 3, N, N]
-    //   Channel 0: h * HEIGHT_SCALE        → vertex Y position
-    //   Channel 1: dh/dx * HEIGHT_SCALE    → used for normal X + choppy X displacement
-    //   Channel 2: dh/dy * HEIGHT_SCALE    → used for normal Z + choppy Z displacement
-    for (int j = 0; j < N; j++) {
-        for (int i = 0; i < N; i++) {
-            int idx = j * N + i;
-            float dhdx = float(g_renderBuf[NN + idx]);
-            float dhdz = float(g_renderBuf[2 * NN + idx]);
-            float base_x = float(i) - GRID * 0.5f;
-            float base_z = float(j) - GRID * 0.5f;
-
-            // Choppy Gerstner-like horizontal displacement (sharp crests, broad troughs)
-            g_verts[idx].pos.x = base_x - g_chopScale * dhdx;
-            g_verts[idx].pos.z = base_z - g_chopScale * dhdz;
-            g_verts[idx].pos.y = float(g_renderBuf[idx]) * g_heightScale;
-
-            g_verts[idx].nrm.x = -dhdx;
-            g_verts[idx].nrm.y = g_normalY;
-            g_verts[idx].nrm.z = -dhdz;
-        }
+    // NPU render output layout: [1, 10, N, N]
+    //   Channel 0-2: pos_x, pos_y, pos_z  (choppy displaced + height scaled)
+    //   Channel 3-5: nrm_x, nrm_y, nrm_z (surface normals)
+    //   Channel 6: caustic
+    //   Channel 7-8: refract_x, refract_z
+    //   Channel 9: foam density [0..1]
+    for (int idx = 0; idx < NN; idx++) {
+        g_verts[idx].pos.x = float(g_renderBuf[0 * NN + idx]);
+        g_verts[idx].pos.y = float(g_renderBuf[1 * NN + idx]);
+        g_verts[idx].pos.z = float(g_renderBuf[2 * NN + idx]);
+        g_verts[idx].nrm.x = float(g_renderBuf[3 * NN + idx]);
+        g_verts[idx].nrm.y = float(g_renderBuf[4 * NN + idx]);
+        g_verts[idx].nrm.z = float(g_renderBuf[5 * NN + idx]);
+        g_verts[idx].foam  = g_foamEnabled ? float(g_renderBuf[9 * NN + idx]) : 0.0f;
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1116,6 +1107,7 @@ static void render() {
     cb.fresnelMax = g_fresnelMax;
     cb.specPow    = g_specPow;
     cb.specStr    = g_specStr;
+    cb.foamOpacity = g_foamOpacity;
 
     g_ctx->RSSetState(g_rs);
     g_ctx->IASetInputLayout(g_il);
@@ -1130,9 +1122,9 @@ static void render() {
     g_ctx->Map(g_causticTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     const int NN = GRID * GRID;
     auto* dst = reinterpret_cast<uint16_t*>(mapped.pData);
-    auto* causticSrc  = reinterpret_cast<const uint16_t*>(&g_renderBuf[3 * NN]);
-    auto* refractXSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[4 * NN]);
-    auto* refractZSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[5 * NN]);
+    auto* causticSrc  = reinterpret_cast<const uint16_t*>(&g_renderBuf[6 * NN]);
+    auto* refractXSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[7 * NN]);
+    auto* refractZSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[8 * NN]);
     int dstPitch = mapped.RowPitch / 2;  // in uint16_t units
     for (int row = 0; row < GRID; row++) {
         for (int col = 0; col < GRID; col++) {
@@ -1167,9 +1159,9 @@ static void render() {
     ID3D11ShaderResourceView* nullSRV = nullptr;
     g_ctx->PSSetShaderResources(0, 1, &nullSRV);
 
-    // --- Rubber duck (yellow body + orange bill) ---
-    {
-        XMVECTOR surfN = XMVector3Normalize(XMVectorSet(-g_duckTiltX, g_normalY, -g_duckTiltZ, 0));
+    // --- Helper lambda to draw a duck at given position/tilt ---
+    auto drawDuck = [&](float dx, float dy, float dz, float dtiltX, float dtiltZ) {
+        XMVECTOR surfN = XMVector3Normalize(XMVectorSet(-dtiltX, g_normalY, -dtiltZ, 0));
         XMVECTOR upV = XMVectorSet(0, 1, 0, 0);
         XMVECTOR axis = XMVector3Cross(upV, surfN);
         float dot = XMVectorGetY(surfN);
@@ -1180,7 +1172,7 @@ static void render() {
 
         XMMATRIX duckWorld = XMMatrixScaling(DUCK_SCALE, DUCK_SCALE, DUCK_SCALE)
                            * tilt
-                           * XMMatrixTranslation(g_duckX, g_duckY, g_duckZ);
+                           * XMMatrixTranslation(dx, dy, dz);
         XMMATRIX duckWvp = duckWorld * vp;
         XMStoreFloat4x4(&cb.wvp, XMMatrixTranspose(duckWvp));
         XMStoreFloat4x4(&cb.world, XMMatrixTranspose(duckWorld));
@@ -1193,37 +1185,22 @@ static void render() {
         g_ctx->IASetIndexBuffer(g_duckIB, DXGI_FORMAT_R32_UINT, 0);
         g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
 
-        // Body (yellow)
         g_ctx->PSSetShader(g_duckPS, nullptr, 0);
         g_ctx->DrawIndexed(g_duckBodyNumIdx, 0, 0);
 
-        // Bill (orange)
         g_ctx->PSSetShader(g_billPS, nullptr, 0);
         g_ctx->DrawIndexed(g_duckBillNumIdx, g_duckBillStart, 0);
-    }
+    };
 
-    // --- Ball (if dragging) ---
-    if (g_dragging) {
-        XMMATRIX ballWorld = XMMatrixScaling(g_ballRadius, g_ballRadius, g_ballRadius)
-                            * XMMatrixTranslation(g_ballX, 0.0f, g_ballZ);
-        XMStoreFloat4x4(&cb.wvp, XMMatrixTranspose(ballWorld * vp));
-        XMStoreFloat4x4(&cb.world, XMMatrixTranspose(ballWorld));
+    // --- Duck 1 ---
+    drawDuck(g_duckX, g_duckY, g_duckZ, g_duckTiltX, g_duckTiltZ);
 
-        g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        memcpy(mapped.pData, &cb, sizeof(cb));
-        g_ctx->Unmap(g_cb, 0);
-
-        g_ctx->IASetVertexBuffers(0, 1, &g_ballVB, &stride, &offset);
-        g_ctx->IASetIndexBuffer(g_ballIB, DXGI_FORMAT_R32_UINT, 0);
-        g_ctx->PSSetShader(g_ballPS, nullptr, 0);
-        g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
-        g_ctx->DrawIndexed(g_ballNumIdx, 0, 0);
-    }
+    // --- Duck 2 ---
+    drawDuck(g_duck2X, g_duck2Y, g_duck2Z, g_duck2TiltX, g_duck2TiltZ);
 
     // === PASS 2: Transparent water with alpha blending ===
     float blendFactor[] = {0, 0, 0, 0};
     g_ctx->OMSetBlendState(g_blend, blendFactor, 0xFFFFFFFF);
-
     XMStoreFloat4x4(&cb.wvp, XMMatrixTranspose(vp));
     XMStoreFloat4x4(&cb.world, XMMatrixTranspose(XMMatrixIdentity()));
     g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1259,6 +1236,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_splashRadius = 20.0f; g_splashHeight = 0.15f;
         }
         if (wp == 'R')       resetState();
+        if (wp == 'F')       g_foamEnabled = !g_foamEnabled;
         if (wp == 'T' && g_panelHwnd) {
             g_showPanel = !g_showPanel;
             ShowWindow(g_panelHwnd, g_showPanel ? SW_SHOW : SW_HIDE);
@@ -1270,17 +1248,16 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         float my = static_cast<float>(HIWORD(lp));
         float wx, wz;
         if (mouseToWaterPlane(mx, my, wx, wz)) {
-            float half = GRID * 0.5f - g_ballRadius;
-            wx = std::max(-half, std::min(half, wx));
-            wz = std::max(-half, std::min(half, wz));
-            g_dragging  = true;
-            g_ballX     = wx;
-            g_ballZ     = wz;
-            g_ballPrevX = wx;
-            g_ballPrevZ = wz;
-            g_splashX = wx; g_splashZ = wz;
-            g_splashRadius = 20.0f; g_splashHeight = 0.15f;
-            SetCapture(hwnd);
+            float d1 = (wx - g_duckX) * (wx - g_duckX) + (wz - g_duckZ) * (wz - g_duckZ);
+            float d2 = (wx - g_duck2X) * (wx - g_duck2X) + (wz - g_duck2Z) * (wz - g_duck2Z);
+            float pickR = DUCK_SCALE * DUCK_SCALE;
+            if (d1 <= d2 && d1 < pickR) {
+                g_draggedDuck = 0;
+                SetCapture(hwnd);
+            } else if (d2 < pickR) {
+                g_draggedDuck = 1;
+                SetCapture(hwnd);
+            }
         }
         return 0;
     }
@@ -1292,22 +1269,22 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             float dx = mx - g_rDragStartX;
             g_camAngle = g_rDragStartAngle - dx * 0.01f;
         }
-        if (g_dragging) {
+        if (g_draggedDuck >= 0) {
             float wx, wz;
             if (mouseToWaterPlane(mx, my, wx, wz)) {
-                float half = GRID * 0.5f - g_ballRadius;
+                float half = GRID * 0.5f - DUCK_SCALE * 0.5f;
                 wx = std::max(-half, std::min(half, wx));
                 wz = std::max(-half, std::min(half, wz));
-                g_ballX = wx;
-                g_ballZ = wz;
+                if (g_draggedDuck == 0) { g_duckX = wx; g_duckZ = wz; }
+                else                    { g_duck2X = wx; g_duck2Z = wz; }
             }
         }
         return 0;
     }
 
     case WM_LBUTTONUP:
-        if (g_dragging) {
-            g_dragging = false;
+        if (g_draggedDuck >= 0) {
+            g_draggedDuck = -1;
             if (!g_rDragging) ReleaseCapture();
         }
         return 0;
@@ -1323,7 +1300,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONUP:
         if (g_rDragging) {
             g_rDragging = false;
-            if (!g_dragging) ReleaseCapture();
+            if (g_draggedDuck < 0) ReleaseCapture();
         }
         return 0;
 
@@ -1365,7 +1342,7 @@ int main(int argc, char* argv[]) {
     AdjustWindowRect(&r, style, FALSE);
 
     g_hwnd = CreateWindowW(
-        L"NPUWater", L"NPU Ocean Simulation \u2014 Intel NPU FP16 Physics",
+        L"NPUWater", L"NPU Bath",
         style, CW_USEDEFAULT, CW_USEDEFAULT,
         r.right - r.left, r.bottom - r.top,
         nullptr, nullptr, wc.hInstance, nullptr);
@@ -1374,7 +1351,7 @@ int main(int argc, char* argv[]) {
 
     printf("=== Ocean Simulation [%s] ===\n", g_device.c_str());
     printf("32 Gerstner waves + interactive ripples, all FP16 on %s\n", g_device.c_str());
-    printf("Controls:  Left-drag = ball | Right-drag = rotate | Scroll = zoom | Space = splash | R = reset | T = sliders | Esc = quit\n\n");
+    printf("Controls:  Left-drag = grab duck | Right-drag = rotate | Scroll = zoom | Space = splash | R = reset | T = sliders | Esc = quit\n\n");
 
     initD3D();
     printf("[OK] D3D11 device created\n");
@@ -1428,7 +1405,7 @@ int main(int argc, char* argv[]) {
         if (fpsTimer >= 1.0f) {
             char title[128];
             snprintf(title, sizeof(title),
-                     "%s Ocean | %d FPS | %dx%d FP16",
+                     "NPU Bath | %s | %d FPS | %dx%d FP16",
                      g_device.c_str(), frameCount, GRID, GRID);
             SetWindowTextA(g_hwnd, title);
             frameCount = 0;
@@ -1446,9 +1423,6 @@ int main(int argc, char* argv[]) {
     if (g_duckPS) g_duckPS->Release();
     if (g_duckIB) g_duckIB->Release();
     if (g_duckVB) g_duckVB->Release();
-    if (g_ballPS) g_ballPS->Release();
-    if (g_ballIB) g_ballIB->Release();
-    if (g_ballVB) g_ballVB->Release();
     if (g_blend) g_blend->Release();
     if (g_rs)  g_rs->Release();
     if (g_ps)  g_ps->Release();
