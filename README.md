@@ -14,8 +14,7 @@ https://github.com/user-attachments/assets/3c648a21-815f-4de4-a3e5-f68ef0072412
 
 ## What runs on the NPU
 
-
-Everything below executes as a single OpenVINO inference request on the Intel NPU — no CPU fallback, no neural network, just tensor math at FP16 half-precision:
+One `infer()` call per frame computes all of the following on the NPU:
 
 - **32 Gerstner waves** — Phillips spectrum with deep-water dispersion, packed into batch tensors
 - **Interactive ripple layer** — 8-substep Verlet wave equation with damping
