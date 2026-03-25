@@ -11,7 +11,6 @@ I'm not a game developer and I have no background in simulation — I just wante
 ![D3D11](https://img.shields.io/badge/GPU-D3D11-orange)
 
 https://github.com/user-attachments/assets/3c648a21-815f-4de4-a3e5-f68ef0072412  
-https://github.com/user-attachments/assets/f6dcd307-a957-454c-a543-4d9d7e9846a7
 
 ## What runs on the NPU
 
