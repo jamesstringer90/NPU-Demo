@@ -10,7 +10,7 @@ I'm not a game developer and I have no background in simulation — I just wante
 ![OpenVINO](https://img.shields.io/badge/OpenVINO-2025.0-green)
 ![D3D11](https://img.shields.io/badge/GPU-D3D11-orange)
 
-https://github.com/user-attachments/assets/6e632d36-5d03-4ab2-be6c-53e98c07bb05
+https://github.com/user-attachments/assets/3c648a21-815f-4de4-a3e5-f68ef0072412
 
 ## What runs on the NPU
 
