@@ -9,8 +9,8 @@ Uses the same approach as AAA game engines:
   - Interactive ripple layer for duck/splash interaction (simple wave equation)
 
 All operations are FP16 tensor ops on Intel NPU via OpenVINO.
-  Inputs:  state [1,4,256,256] + time [1,1,1,1] + camera [1,3,1,1]
-  Outputs: new_state [1,4,256,256] + render [1,7,256,256]
+  Inputs:  state [1,4,N,N] + time [1,1,1,1] + camera [1,3,1,1] + ...
+  Outputs: new_state [1,4,N,N] + render [1,10,N,N] + ...
 """
 
 import sys
@@ -81,7 +81,7 @@ def generate_waves():
 
     # Logarithmic k sampling from short to long waves
     k_min = 2.0 * math.pi / 300.0   # longest wave: 300 cells (long rolling swells)
-    k_max = 2.0 * math.pi / 40.0    # shortest wave: 40 cells (was 20 — too spiky)
+    k_max = 2.0 * math.pi / 40.0    # shortest wave: 40 cells
     log_ratio = math.log(k_max / k_min)
 
     for i in range(N_WAVES):
@@ -202,17 +202,19 @@ def create_model(output_path: str):
     sec_clip_min = np.array([1.0], dtype=np.float16)
     sec_clip_max = np.array([3.0], dtype=np.float16)
 
+    # --- Duck hull displacement + wake (NPU, full NxN tensor ops) ---
+    DUCK_R = 45.0 * 0.4   # waterline footprint radius (DUCK_SCALE * 0.4)
+
     # --- Duck physics (NPU integration, CPU supplies slope at duck position) ---
     # All rates are per-second; multiplied by dt input for frame-rate independence
-    duck_force = np.array([[[[-80.0]]]], dtype=np.float16)  # force per second
+    grid_scale = N / 256.0  # scale physics for larger grids
+    duck_force = np.array([[[[-80.0 * grid_scale]]]], dtype=np.float16)  # force per second (scaled for grid size)
     # Drag as exponential decay: drag_per_frame = exp(-decay_rate * dt)
     # At 30fps: 0.92 = exp(-rate * 0.033) → rate = -ln(0.92)/0.033 ≈ 2.53
     duck_decay_rate = np.array([[[[math.log(0.92) / 0.033]]]], dtype=np.float16)  # negative → exp(neg*dt) < 1
-    duck_pos_min = np.array([-110.0], dtype=np.float16)  # GRID/2 - DUCK_R = 128 - 18
-    duck_pos_max = np.array([110.0], dtype=np.float16)
-
-    # --- Duck hull displacement + wake (NPU, full 256x256 tensor ops) ---
-    DUCK_R = 45.0 * 0.4   # waterline footprint radius (DUCK_SCALE * 0.4)
+    duck_pos_limit = N * 0.5 - DUCK_R
+    duck_pos_min = np.array([-duck_pos_limit], dtype=np.float16)
+    duck_pos_max = np.array([duck_pos_limit], dtype=np.float16)
     hull_sigma = DUCK_R * 0.35  # tighter Gaussian — falls off faster
     hull_neg_inv_2s2 = np.array([[[[-1.0 / (2.0 * hull_sigma ** 2)]]]], dtype=np.float16)
     hull_depth = np.array([[[[-0.015]]]], dtype=np.float16)  # depression per second (scaled by dt)
