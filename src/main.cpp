@@ -20,11 +20,25 @@
  */
 
 #include <windows.h>
+#include <intrin.h>
 #include <commctrl.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
+#include <DirectXPackedVector.h>
+
+#ifdef HAS_OPENVINO
 #include <openvino/openvino.hpp>
+#endif
+
+#ifdef HAS_WINDOWSML
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Microsoft.Windows.AI.MachineLearning.h>
+#include <winml/onnxruntime_cxx_api.h>
+namespace WinML = winrt::Microsoft::Windows::AI::MachineLearning;
+#endif
 
 #include <vector>
 #include <random>
@@ -32,6 +46,7 @@
 #include <cstdio>
 #include <cmath>
 #include <string>
+#include <memory>
 #include <unordered_map>
 
 #pragma comment(lib, "d3d11.lib")
@@ -40,6 +55,381 @@
 #pragma comment(lib, "comctl32.lib")
 
 using namespace DirectX;
+
+// ---------------------------------------------------------------------------
+// Inference backend abstraction — allows OpenVINO or ONNX Runtime
+// ---------------------------------------------------------------------------
+struct InferenceBackend {
+    virtual ~InferenceBackend() = default;
+    virtual uint16_t* getInput(int index) = 0;
+    virtual const uint16_t* getOutput(int index) = 0;
+    virtual void infer() = 0;
+    virtual std::string name() const = 0;
+    virtual bool isBf16() const { return false; }
+    virtual bool isFp32Model() const { return false; }
+};
+
+// FP16 conversion
+inline uint16_t f32_to_fp16(float v) { return PackedVector::XMConvertFloatToHalf(v); }
+inline float fp16_to_f32(uint16_t v) { return PackedVector::XMConvertHalfToFloat(v); }
+
+// BF16: upper 16 bits of IEEE 754 float32
+inline uint16_t f32_to_bf16(float v) { uint32_t u; memcpy(&u, &v, 4); return uint16_t(u >> 16); }
+inline float bf16_to_f32(uint16_t v) { uint32_t u = uint32_t(v) << 16; float f; memcpy(&f, &u, 4); return f; }
+
+// Active conversion functions — set once when backend is initialized
+static uint16_t (*f32_to_f16)(float) = f32_to_fp16;
+static float (*f16_to_f32)(uint16_t) = fp16_to_f32;
+
+#ifdef HAS_OPENVINO
+class OpenVinoBackend : public InferenceBackend {
+    ov::InferRequest req_;
+    std::string device_;
+public:
+    OpenVinoBackend(const std::string& modelPath, const std::string& device)
+        : device_(device)
+    {
+        ov::Core core;
+        auto devices = core.get_available_devices();
+        printf("OpenVINO devices:\n");
+        bool deviceFound = false;
+        for (auto& d : devices) {
+            std::string caps;
+            try {
+                auto opt = core.get_property(d, ov::device::capabilities);
+                for (auto& c : opt) { if (!caps.empty()) caps += ", "; caps += c; }
+            } catch (...) {}
+            printf("  %-8s  [%s]\n", d.c_str(), caps.c_str());
+            if (d.find(device) != std::string::npos) deviceFound = true;
+        }
+        if (!deviceFound) {
+            std::string msg = "Device '" + device + "' not found.\nAvailable: ";
+            for (auto& d : devices) msg += d + " ";
+            throw std::runtime_error(msg);
+        }
+        auto model = core.read_model(modelPath);
+        printf("Model loaded, compiling for %s ...\n", device.c_str());
+        auto compiled = core.compile_model(model, device);
+        req_ = compiled.create_infer_request();
+    }
+
+    uint16_t* getInput(int i) override {
+        return reinterpret_cast<uint16_t*>(req_.get_input_tensor(i).data<ov::float16>());
+    }
+    const uint16_t* getOutput(int i) override {
+        return reinterpret_cast<const uint16_t*>(req_.get_output_tensor(i).data<ov::float16>());
+    }
+    void infer() override { req_.infer(); }
+    std::string name() const override { return "OpenVINO (" + device_ + ")"; }
+
+    static bool hasIntelNPU() {
+        try {
+            ov::Core probe;
+            for (auto& d : probe.get_available_devices())
+                if (d.find("NPU") != std::string::npos) return true;
+        } catch (...) {}
+        return false;
+    }
+};
+#endif
+
+// ---------------------------------------------------------------------------
+// Windows ML backend — auto-selects vendor EP (QNN, Vitis AI, DirectML, etc.)
+// Uses ONNX Runtime bundled in Microsoft.WindowsAppSDK.ML NuGet package.
+// The EP catalog downloads vendor-specific NPU drivers via Windows Update.
+// ---------------------------------------------------------------------------
+#ifdef HAS_WINDOWSML
+class WindowsMLBackend : public InferenceBackend {
+    Ort::Env env_;
+    Ort::Session session_{nullptr};
+    Ort::MemoryInfo memInfo_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::vector<std::vector<uint16_t>> inputBufs_, outputBufs_;
+    std::vector<std::vector<float>> floatInBufs_, floatOutBufs_;  // for FP32 model path
+    std::vector<std::vector<int64_t>> inputShapes_, outputShapes_;
+    std::vector<std::string> inputNames_, outputNames_;
+    std::vector<const char*> inputNamePtrs_, outputNamePtrs_;
+    std::string epName_, devType_;
+    bool useFp32Model_ = false;  // model is FP32, need float conversion buffers
+    bool hostBf16_ = false;      // host data is BF16 (Vitis AI); false = FP16
+
+public:
+    WindowsMLBackend(const std::string& modelPath, const std::string& device = "NPU")
+        : env_(ORT_LOGGING_LEVEL_WARNING, "npu_bath")
+    {
+        printf("Windows ML: init\n");
+        fflush(stdout);
+
+        // Use WinRT ExecutionProviderCatalog to discover, download, and register
+        // all certified vendor EPs (QNN, Vitis AI, OpenVINO, etc.)
+        printf("Windows ML: discovering and registering execution providers...\n");
+        fflush(stdout);
+        bool hasVitisAI = false;
+        try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            printf("  WinRT apartment initialized\n");
+            fflush(stdout);
+            WinML::ExecutionProviderCatalog catalog = WinML::ExecutionProviderCatalog::GetDefault();
+            printf("  Got EP catalog, calling EnsureAndRegisterCertifiedAsync...\n");
+            fflush(stdout);
+            auto op = catalog.EnsureAndRegisterCertifiedAsync();
+            op.Progress([](auto const&, double progress) {
+                printf("  EP registration progress: %.0f%%\n", progress);
+                fflush(stdout);
+            });
+            winrt::Windows::Foundation::Collections::IVector<WinML::ExecutionProvider> eps = op.get();
+            printf("  EP registration complete. Found %u EPs:\n", eps.Size());
+            fflush(stdout);
+            for (uint32_t i = 0; i < eps.Size(); i++) {
+                WinML::ExecutionProvider ep = eps.GetAt(i);
+                std::string name = winrt::to_string(ep.Name());
+                WinML::ExecutionProviderReadyState rs = ep.ReadyState();
+                const char* state = "unknown";
+                if (rs == WinML::ExecutionProviderReadyState::Ready)      state = "ready+registered";
+                else if (rs == WinML::ExecutionProviderReadyState::NotReady)  state = "not ready";
+                else if (rs == WinML::ExecutionProviderReadyState::NotPresent) state = "not present";
+                printf("  EP[%u]: %-30s [%s]\n", i, name.c_str(), state);
+                fflush(stdout);
+                if (name.find("VitisAI") != std::string::npos &&
+                    rs == WinML::ExecutionProviderReadyState::Ready) {
+                    hasVitisAI = true;
+                }
+            }
+            if (eps.Size() == 0) printf("  (no vendor EPs found)\n");
+        } catch (const winrt::hresult_error& e) {
+            printf("  EP catalog error: %ls (0x%08X)\n", e.message().c_str(), static_cast<unsigned>(e.code()));
+        }
+        fflush(stdout);
+
+        // Select FP32 model when needed (Vitis AI or GPU/DirectML)
+        std::string actualModel = modelPath;
+        std::string fp32Path = modelPath.substr(0, modelPath.rfind('.')) + "_fp32.onnx";
+        bool fp32Exists = GetFileAttributesA(fp32Path.c_str()) != INVALID_FILE_ATTRIBUTES;
+
+        if (hasVitisAI) {
+            if (fp32Exists) {
+                actualModel = fp32Path;
+                useFp32Model_ = true;
+                hostBf16_ = true;  // Vitis AI uses BF16 encoding
+                printf("  Vitis AI detected — using FP32 model: %s\n", fp32Path.c_str());
+            } else {
+                printf("  WARNING: Vitis AI detected but %s not found — using FP16\n", fp32Path.c_str());
+            }
+        } else if (device == "GPU" && fp32Exists) {
+            // DirectML has FP16 Conv precision issues — use FP32 model
+            actualModel = fp32Path;
+            useFp32Model_ = true;
+            hostBf16_ = false;  // host stays FP16
+            printf("  GPU mode — using FP32 model (avoids DirectML FP16 Conv issues): %s\n", fp32Path.c_str());
+        }
+        printf("  Model file: %s\n", actualModel.c_str());
+        fflush(stdout);
+
+        // Configure session
+        printf("  Creating session options...\n");
+        fflush(stdout);
+        Ort::SessionOptions opts;
+        opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        if (device == "GPU") {
+            printf("  Device: GPU (DirectML)\n");
+            opts.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_GPU);
+        } else if (hasVitisAI && device != "CPU") {
+            // Write minimal Vitis AI config — no target section (Windows ML provides its own)
+            const char* configJson = R"({
+  "passes": [
+    {"name": "init", "plugin": "vaip-pass_init"},
+    {"name": "vaiml_partition", "plugin": "vaip-pass_vaiml_partition",
+     "vaiml_config": {"enable_f32_to_bf16_conversion": true}}
+  ]
+})";
+            FILE* f = fopen("vai_ep_config.json", "w");
+            if (f) { fputs(configJson, f); fclose(f); }
+            printf("  Wrote vai_ep_config.json (enable_f32_to_bf16_conversion=true)\n");
+            fflush(stdout);
+
+            // Use generic C API — EP already registered by Windows ML
+            const char* keys[] = {"config_file"};
+            const char* vals[] = {"vai_ep_config.json"};
+            OrtStatus* status = Ort::GetApi().SessionOptionsAppendExecutionProvider(
+                opts, "VitisAI", keys, vals, 1);
+            if (status) {
+                printf("  AppendExecutionProvider(VitisAI) failed: %s\n",
+                       Ort::GetApi().GetErrorMessage(status));
+                Ort::GetApi().ReleaseStatus(status);
+                printf("  Falling back to PREFER_NPU\n");
+                opts.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_NPU);
+            } else {
+                printf("  Appended VitisAI EP with config_file\n");
+            }
+            fflush(stdout);
+        } else {
+            opts.SetEpSelectionPolicy(OrtExecutionProviderDevicePolicy_PREFER_NPU);
+        }
+
+        // Load model — this is where the EP compiler runs (may take minutes on first run)
+        printf("  Creating ORT session (EP compilation may take a few minutes on first run)...\n");
+        fflush(stdout);
+        auto t0 = std::chrono::steady_clock::now();
+        std::wstring wpath(actualModel.begin(), actualModel.end());
+        session_ = Ort::Session(env_, wpath.c_str(), opts);
+        auto t1 = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        printf("  Session created in %.1f seconds\n", secs);
+        fflush(stdout);
+
+        // Query input/output names and shapes from model
+        Ort::AllocatorWithDefaultOptions alloc;
+        size_t numIn = session_.GetInputCount();
+        size_t numOut = session_.GetOutputCount();
+        printf("  Model: %zu inputs, %zu outputs\n", numIn, numOut);
+
+        for (size_t i = 0; i < numIn; i++) {
+            auto n = session_.GetInputNameAllocated(i, alloc);
+            inputNames_.push_back(n.get());
+            auto info = session_.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+            auto elemType = info.GetElementType();
+            inputShapes_.push_back(info.GetShape());
+            int64_t count = 1;
+            std::string shapeStr = "[";
+            for (auto d : inputShapes_.back()) { count *= d; shapeStr += std::to_string(d) + ","; }
+            shapeStr.back() = ']';
+            printf("  Input[%zu]: %-20s shape=%-20s type=%d elements=%lld\n",
+                   i, inputNames_.back().c_str(), shapeStr.c_str(), (int)elemType, (long long)count);
+            inputBufs_.emplace_back(count, uint16_t(0));
+        }
+        for (size_t i = 0; i < numOut; i++) {
+            auto n = session_.GetOutputNameAllocated(i, alloc);
+            outputNames_.push_back(n.get());
+            auto info = session_.GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
+            auto elemType = info.GetElementType();
+            outputShapes_.push_back(info.GetShape());
+            int64_t count = 1;
+            std::string shapeStr = "[";
+            for (auto d : outputShapes_.back()) { count *= d; shapeStr += std::to_string(d) + ","; }
+            shapeStr.back() = ']';
+            printf("  Output[%zu]: %-20s shape=%-20s type=%d elements=%lld\n",
+                   i, outputNames_.back().c_str(), shapeStr.c_str(), (int)elemType, (long long)count);
+            outputBufs_.emplace_back(count, uint16_t(0));
+        }
+
+        for (auto& s : inputNames_) inputNamePtrs_.push_back(s.c_str());
+        for (auto& s : outputNames_) outputNamePtrs_.push_back(s.c_str());
+
+        // Pre-allocate float buffers for FP32 model path (Vitis AI or GPU)
+        if (useFp32Model_) {
+            for (auto& buf : inputBufs_)  floatInBufs_.emplace_back(buf.size(), 0.0f);
+            for (auto& buf : outputBufs_) floatOutBufs_.emplace_back(buf.size(), 0.0f);
+            printf("  Allocated FP32 conversion buffers\n");
+        }
+        fflush(stdout);
+
+        // Report which EP/device was selected for the model
+        printf("  Querying EP device assignment...\n");
+        fflush(stdout);
+        try {
+            auto devices = session_.GetEpDeviceForInputs();
+            printf("  %zu device assignment(s):\n", devices.size());
+            for (auto& dev : devices) {
+                const char* devType = "unknown";
+                switch (dev.Device().Type()) {
+                    case 0: devType = "CPU"; break;
+                    case 1: devType = "GPU"; break;
+                    case 2: devType = "NPU"; break;
+                }
+                printf("  -> EP: %s  vendor: %s  device: %s\n", dev.EpName(), dev.EpVendor(), devType);
+                epName_ = dev.EpName();
+                devType_ = devType;
+            }
+        } catch (const Ort::Exception& e) {
+            printf("  GetEpDeviceForInputs failed: %s\n", e.what());
+        } catch (...) {
+            printf("  GetEpDeviceForInputs failed (unknown error)\n");
+        }
+
+        printf("Windows ML: ready (%s)\n", name().c_str());
+        fflush(stdout);
+    }
+
+    uint16_t* getInput(int i) override { return inputBufs_[i].data(); }
+    const uint16_t* getOutput(int i) override { return outputBufs_[i].data(); }
+
+    void infer() override {
+        if (useFp32Model_) {
+            // FP32 model path: convert host uint16_t inputs → float, run, convert back
+            std::vector<Ort::Value> inputs;
+            for (size_t i = 0; i < inputBufs_.size(); i++) {
+                if (hostBf16_) {
+                    // BF16 → float32 (shift left 16 bits)
+                    for (size_t j = 0; j < inputBufs_[i].size(); j++) {
+                        uint32_t u = uint32_t(inputBufs_[i][j]) << 16;
+                        memcpy(&floatInBufs_[i][j], &u, 4);
+                    }
+                } else {
+                    // FP16 → float32 (proper half-float conversion)
+                    for (size_t j = 0; j < inputBufs_[i].size(); j++)
+                        floatInBufs_[i][j] = fp16_to_f32(inputBufs_[i][j]);
+                }
+                inputs.push_back(Ort::Value::CreateTensor(
+                    memInfo_, floatInBufs_[i].data(), floatInBufs_[i].size() * sizeof(float),
+                    inputShapes_[i].data(), inputShapes_[i].size(),
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT));
+            }
+
+            auto outputs = session_.Run(Ort::RunOptions{nullptr},
+                inputNamePtrs_.data(), inputs.data(), inputs.size(),
+                outputNamePtrs_.data(), outputNamePtrs_.size());
+
+            for (size_t i = 0; i < outputBufs_.size(); i++) {
+                auto* src = outputs[i].GetTensorData<float>();
+                if (hostBf16_) {
+                    // float32 → BF16 (shift right 16 bits)
+                    for (size_t j = 0; j < outputBufs_[i].size(); j++) {
+                        uint32_t u;
+                        memcpy(&u, &src[j], 4);
+                        outputBufs_[i][j] = uint16_t(u >> 16);
+                    }
+                } else {
+                    // float32 → FP16 (proper conversion)
+                    for (size_t j = 0; j < outputBufs_[i].size(); j++)
+                        outputBufs_[i][j] = f32_to_fp16(src[j]);
+                }
+            }
+        } else {
+            // FP16 model path: direct uint16_t tensors
+            std::vector<Ort::Value> inputs;
+            for (size_t i = 0; i < inputBufs_.size(); i++) {
+                inputs.push_back(Ort::Value::CreateTensor(
+                    memInfo_, inputBufs_[i].data(), inputBufs_[i].size() * sizeof(uint16_t),
+                    inputShapes_[i].data(), inputShapes_[i].size(),
+                    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16));
+            }
+
+            auto outputs = session_.Run(Ort::RunOptions{nullptr},
+                inputNamePtrs_.data(), inputs.data(), inputs.size(),
+                outputNamePtrs_.data(), outputNamePtrs_.size());
+
+            for (size_t i = 0; i < outputBufs_.size(); i++) {
+                auto* src = outputs[i].GetTensorData<uint16_t>();
+                memcpy(outputBufs_[i].data(), src, outputBufs_[i].size() * sizeof(uint16_t));
+            }
+        }
+    }
+
+    std::string name() const override {
+        if (!epName_.empty()) return "Windows ML (" + epName_ + ", " + devType_ + ")";
+        return "Windows ML";
+    }
+    bool isBf16() const override { return hostBf16_; }
+    bool isFp32Model() const override { return useFp32Model_; }
+};
+#endif
+
+enum class RuntimeChoice { Auto, OpenVINO, WindowsML };
+static RuntimeChoice g_runtimeChoice = RuntimeChoice::Auto;
+
+enum class Scene { Water, Balls };
+static Scene g_scene = Scene::Water;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -93,6 +483,35 @@ struct alignas(16) CB {
     XMFLOAT3   eye;      float _1; // 16 bytes
     float      time;     float fresnelPow; float fresnelMin; float fresnelMax; // 16 bytes
     float      specPow;  float specStr;    float foamOpacity; float _3; // 16 bytes  (total: 192)
+};
+
+// ---------------------------------------------------------------------------
+// Ball pit configuration
+// ---------------------------------------------------------------------------
+static constexpr int   NUM_BALLS        = 1024;
+static constexpr float BALL_RADIUS      = 2.0f;
+static constexpr float BOX_HALF         = 30.0f;
+static constexpr float BOX_HEIGHT       = 10.0f;
+static constexpr float BALL_GRAVITY     = -49.05f;
+static constexpr float BALL_RESTITUTION = 0.6f;
+static constexpr float BALL_FRICTION    = 0.98f;
+
+struct BallVertex {
+    XMFLOAT3 pos;
+    XMFLOAT3 nrm;
+};
+
+struct SphereInstance {
+    XMFLOAT3 pos;
+    float    radius;
+    XMFLOAT3 color;
+};
+
+struct Ball {
+    XMFLOAT3 pos;
+    XMFLOAT3 vel;
+    float    radius;
+    XMFLOAT3 color;
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +712,99 @@ float4 main(I i) : SV_TARGET {
 }
 )";
 
+// Ball pit instanced vertex shader
+static const char* g_ballVsSource = R"(
+cbuffer CB : register(b0) {
+    float4x4 wvp;
+    float4x4 world;
+    float3   lightDir; float _0;
+    float3   eye;      float _1;
+    float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
+    float    specPow;  float specStr;    float foamOpacity; float _3;
+};
+struct VSIn {
+    float3 pos : POSITION;
+    float3 nrm : NORMAL;
+    float3 iPos : INST_POS;
+    float  iRad : INST_RAD;
+    float3 iCol : INST_COL;
+};
+struct VSOut {
+    float4 sv  : SV_POSITION;
+    float3 n   : NORMAL;
+    float3 wp  : TEXCOORD0;
+    float3 col : TEXCOORD1;
+};
+VSOut main(VSIn i) {
+    VSOut o;
+    float3 wp = i.pos * i.iRad + i.iPos;
+    o.wp = wp;
+    o.sv = mul(float4(wp, 1), wvp);
+    o.n  = i.nrm;
+    o.col = i.iCol;
+    return o;
+}
+)";
+
+// Ball pit sphere pixel shader (Blinn-Phong with rim light)
+static const char* g_ballPsSource = R"(
+cbuffer CB : register(b0) {
+    float4x4 wvp;
+    float4x4 world;
+    float3   lightDir; float _0;
+    float3   eye;      float _1;
+    float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
+    float    specPow;  float specStr;    float foamOpacity; float _3;
+};
+struct PSIn {
+    float4 sv  : SV_POSITION;
+    float3 n   : NORMAL;
+    float3 wp  : TEXCOORD0;
+    float3 col : TEXCOORD1;
+};
+float4 main(PSIn i) : SV_TARGET {
+    float3 N = normalize(i.n);
+    float3 L = normalize(lightDir);
+    float3 V = normalize(eye - i.wp);
+    float3 R = reflect(-L, N);
+    float3 H = normalize(L + V);
+    float diff = saturate(dot(N, L)) * 0.6 + 0.35;
+    float spec = pow(max(dot(N, H), 0.0), 256.0) * 1.2;
+    float spec2 = pow(max(dot(V, R), 0.0), 64.0) * 0.4;
+    float rim = pow(1.0 - saturate(dot(N, V)), 4.0) * 0.3;
+    float fresnel = lerp(0.04, 0.6, pow(1.0 - saturate(dot(N, V)), 5.0));
+    float3 envUp = float3(0.6, 0.7, 0.8);
+    float3 envDn = float3(0.2, 0.2, 0.25);
+    float3 env = lerp(envDn, envUp, N.y * 0.5 + 0.5);
+    float3 color = i.col * diff + float3(1,1,1) * (spec + spec2) + fresnel * env + i.col * rim;
+    return float4(color, 1.0);
+}
+)";
+
+// Box pixel shader (solid gray with simple lighting)
+static const char* g_boxPsSource = R"(
+cbuffer CB : register(b0) {
+    float4x4 wvp;
+    float4x4 world;
+    float3   lightDir; float _0;
+    float3   eye;      float _1;
+    float    time;     float fresnelPow; float fresnelMin; float fresnelMax;
+    float    specPow;  float specStr;    float foamOpacity; float _3;
+};
+struct PSIn {
+    float4 sv : SV_POSITION;
+    float3 n  : NORMAL;
+    float3 wp : TEXCOORD0;
+    float  foam : TEXCOORD1;
+};
+float4 main(PSIn i) : SV_TARGET {
+    float3 N = normalize(i.n);
+    float3 L = normalize(lightDir);
+    float diff = saturate(dot(N, L)) * 0.5 + 0.5;
+    float3 color = float3(0.85, 0.85, 0.88) * diff;
+    return float4(color, 1.0);
+}
+)";
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -347,10 +859,10 @@ static constexpr float DUCK_SCALE = 45.0f;
 // Mouse drag state
 static int   g_draggedDuck = -1;  // -1 = none, 0 = duck1, 1 = duck2
 
-static ov::InferRequest             g_infer;
-static std::vector<ov::float16>     g_state;      // [2 * GRID * GRID] — h_cur + h_prev
-static std::vector<ov::float16>     g_wavePhase;  // [32] — per-wave wrapped omega*time (maintained on NPU)
-static std::vector<ov::float16>     g_renderBuf;  // [10 * GRID * GRID] — NPU render output (pos_x, pos_y, pos_z, nrm_x, nrm_y, nrm_z, caustic, refract_x, refract_z, foam)
+static std::unique_ptr<InferenceBackend> g_backend;
+static std::vector<uint16_t>        g_state;      // [4 * GRID * GRID] — FP16 ripple state
+static std::vector<uint16_t>        g_wavePhase;  // [32] — per-wave wrapped omega*time (maintained on NPU)
+static std::vector<uint16_t>        g_renderBuf;  // [10 * GRID * GRID] — NPU render output (pos, nrm, caustic, refract, foam)
 static std::vector<Vertex>          g_verts;       // [GRID * GRID]
 static UINT                         g_numIdx = 0;
 
@@ -360,6 +872,31 @@ static float    g_dt      = 0.033f;  // frame delta time (passed to NPU for rate
 static bool     g_running = true;
 static std::string g_device = "NPU";  // OpenVINO device: "NPU" or "CPU"
 static std::mt19937 g_rng{42};
+
+// Ball pit state
+static std::vector<Ball>           g_balls;
+static std::vector<SphereInstance>  g_ballInstances;
+static ID3D11Buffer*               g_ballSphereVB = nullptr;
+static ID3D11Buffer*               g_ballSphereIB = nullptr;
+static ID3D11Buffer*               g_ballInstBuf  = nullptr;
+static ID3D11VertexShader*         g_ballVS       = nullptr;
+static ID3D11PixelShader*          g_ballPS       = nullptr;
+static ID3D11PixelShader*          g_boxPS        = nullptr;
+static ID3D11InputLayout*          g_ballIL       = nullptr;
+static ID3D11RasterizerState*      g_noCullRS     = nullptr;
+static ID3D11Buffer*               g_boxVB        = nullptr;
+static ID3D11Buffer*               g_boxIB        = nullptr;
+static UINT                        g_ballSphereNumIdx = 0;
+static UINT                        g_boxNumIdx    = 0;
+static int                         g_grabbedBall  = -1;
+static float                       g_grabY        = 0.0f;
+static float                       g_ballCamDist  = 80.0f;
+static float                       g_ballCamHeight = 50.0f;
+static float                       g_ballCamAngle = 0.0f;
+static bool                        g_ballRDrag    = false;
+static float                       g_ballRDragStartX = 0.0f;
+static float                       g_ballRDragStartAngle = 0.0f;
+static std::unique_ptr<InferenceBackend> g_ballBackend;
 
 // Splash state (consumed by NPU each frame, then cleared)
 static float g_splashX      = 0.0f;
@@ -496,7 +1033,7 @@ static void createSliderPanel(HINSTANCE hInst) {
 // Reset simulation state
 // ---------------------------------------------------------------------------
 static void resetState() {
-    std::fill(g_state.begin(), g_state.end(), ov::float16(0.0f));
+    std::fill(g_state.begin(), g_state.end(), uint16_t(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +1060,24 @@ static bool mouseToWaterPlane(float mx, float my, float& outX, float& outZ) {
     return true;
 }
 
+// Unproject mouse coords to a horizontal plane at given Y
+static bool mouseToHorizPlane(float mx, float my, float planeY, float& outX, float& outZ) {
+    float ndcX = 2.0f * mx / WIN_W - 1.0f;
+    float ndcY = 1.0f - 2.0f * my / WIN_H;
+    XMMATRIX inv = XMMatrixInverse(nullptr, g_lastVP);
+    XMVECTOR nearPt = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 0.0f, 1.0f), inv);
+    XMVECTOR farPt  = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 1.0f, 1.0f), inv);
+    XMVECTOR dir = XMVector3Normalize(farPt - nearPt);
+    float oy = XMVectorGetY(nearPt);
+    float dy = XMVectorGetY(dir);
+    if (fabsf(dy) < 0.001f) return false;
+    float t = (planeY - oy) / dy;
+    if (t <= 0.0f) return false;
+    XMVECTOR hit = nearPt + XMVectorScale(dir, t);
+    outX = XMVectorGetX(hit);
+    outZ = XMVectorGetZ(hit);
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Initialize D3D11
@@ -651,6 +1206,28 @@ static void initShaders() {
     ID3DBlob* tileBlob = compile(g_tilePsSource, "ps_5_0", "main");
     g_dev->CreatePixelShader(tileBlob->GetBufferPointer(), tileBlob->GetBufferSize(), nullptr, &g_tilePS);
     tileBlob->Release();
+
+    // Ball pit shaders
+    ID3DBlob* ballVsBlob = compile(g_ballVsSource, "vs_5_0", "main");
+    g_dev->CreateVertexShader(ballVsBlob->GetBufferPointer(), ballVsBlob->GetBufferSize(), nullptr, &g_ballVS);
+
+    D3D11_INPUT_ELEMENT_DESC ballLayout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA,   0},
+        {"NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA,   0},
+        {"INST_POS", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 0,  D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"INST_RAD", 0, DXGI_FORMAT_R32_FLOAT,       1, 12, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+        {"INST_COL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 16, D3D11_INPUT_PER_INSTANCE_DATA, 1},
+    };
+    g_dev->CreateInputLayout(ballLayout, 5, ballVsBlob->GetBufferPointer(), ballVsBlob->GetBufferSize(), &g_ballIL);
+    ballVsBlob->Release();
+
+    ID3DBlob* ballPsBlob = compile(g_ballPsSource, "ps_5_0", "main");
+    g_dev->CreatePixelShader(ballPsBlob->GetBufferPointer(), ballPsBlob->GetBufferSize(), nullptr, &g_ballPS);
+    ballPsBlob->Release();
+
+    ID3DBlob* boxPsBlob = compile(g_boxPsSource, "ps_5_0", "main");
+    g_dev->CreatePixelShader(boxPsBlob->GetBufferPointer(), boxPsBlob->GetBufferSize(), nullptr, &g_boxPS);
+    boxPsBlob->Release();
 }
 
 // ---------------------------------------------------------------------------
@@ -839,56 +1416,227 @@ static void initMesh() {
 }
 
 // ---------------------------------------------------------------------------
-// Initialize OpenVINO — load model and compile for selected device
+// Initialize ball pit scene
 // ---------------------------------------------------------------------------
-static void initOpenVINO() {
+static void initBallPit() {
+    // --- UV sphere mesh (16 lat x 32 lon) ---
+    std::vector<BallVertex> sphereV;
+    std::vector<uint32_t> sphereI;
+    const int latSegs = 16, lonSegs = 32;
+    for (int lat = 0; lat <= latSegs; lat++) {
+        float theta = float(lat) / latSegs * XM_PI;
+        float sinT = sinf(theta), cosT = cosf(theta);
+        for (int lon = 0; lon <= lonSegs; lon++) {
+            float phi = float(lon) / lonSegs * XM_2PI;
+            XMFLOAT3 p = {sinT * cosf(phi), cosT, sinT * sinf(phi)};
+            sphereV.push_back({p, p});
+        }
+    }
+    for (int lat = 0; lat < latSegs; lat++) {
+        for (int lon = 0; lon < lonSegs; lon++) {
+            int a = lat * (lonSegs + 1) + lon;
+            int b = a + lonSegs + 1;
+            sphereI.push_back(a); sphereI.push_back(b);     sphereI.push_back(a + 1);
+            sphereI.push_back(a + 1); sphereI.push_back(b); sphereI.push_back(b + 1);
+        }
+    }
+    g_ballSphereNumIdx = (UINT)sphereI.size();
+
+    D3D11_BUFFER_DESC svbd{};
+    svbd.ByteWidth = (UINT)(sphereV.size() * sizeof(BallVertex));
+    svbd.Usage     = D3D11_USAGE_DEFAULT;
+    svbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA svsd{sphereV.data()};
+    g_dev->CreateBuffer(&svbd, &svsd, &g_ballSphereVB);
+
+    D3D11_BUFFER_DESC sibd{};
+    sibd.ByteWidth = (UINT)(sphereI.size() * sizeof(uint32_t));
+    sibd.Usage     = D3D11_USAGE_DEFAULT;
+    sibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA sisd{sphereI.data()};
+    g_dev->CreateBuffer(&sibd, &sisd, &g_ballSphereIB);
+
+    // --- Instance buffer (dynamic, updated each frame) ---
+    g_ballInstances.resize(NUM_BALLS);
+    D3D11_BUFFER_DESC ibd{};
+    ibd.ByteWidth      = NUM_BALLS * sizeof(SphereInstance);
+    ibd.Usage          = D3D11_USAGE_DYNAMIC;
+    ibd.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
+    ibd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    g_dev->CreateBuffer(&ibd, nullptr, &g_ballInstBuf);
+
+    // --- Box mesh (5 quads: floor + 4 walls, normals pointing inward) ---
+    std::vector<Vertex> boxV;
+    std::vector<uint32_t> boxI;
+    auto addQuad = [&](XMFLOAT3 a, XMFLOAT3 b, XMFLOAT3 c, XMFLOAT3 d, XMFLOAT3 n) {
+        uint32_t base = (uint32_t)boxV.size();
+        boxV.push_back({a, n, 0}); boxV.push_back({b, n, 0});
+        boxV.push_back({c, n, 0}); boxV.push_back({d, n, 0});
+        boxI.push_back(base); boxI.push_back(base+1); boxI.push_back(base+2);
+        boxI.push_back(base); boxI.push_back(base+2); boxI.push_back(base+3);
+    };
+    float H = BOX_HALF, T = BOX_HEIGHT;
+    addQuad({-H,0,-H}, { H,0,-H}, { H,0, H}, {-H,0, H}, {0,1,0});   // floor
+    addQuad({-H,0,-H}, { H,0,-H}, { H,T,-H}, {-H,T,-H}, {0,0,1});   // back wall
+    addQuad({ H,0, H}, {-H,0, H}, {-H,T, H}, { H,T, H}, {0,0,-1});  // front wall
+    addQuad({-H,0, H}, {-H,0,-H}, {-H,T,-H}, {-H,T, H}, {1,0,0});   // left wall
+    addQuad({ H,0,-H}, { H,0, H}, { H,T, H}, { H,T,-H}, {-1,0,0});  // right wall
+    g_boxNumIdx = (UINT)boxI.size();
+
+    D3D11_BUFFER_DESC bvbd{};
+    bvbd.ByteWidth = (UINT)(boxV.size() * sizeof(Vertex));
+    bvbd.Usage     = D3D11_USAGE_DEFAULT;
+    bvbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA bvsd{boxV.data()};
+    g_dev->CreateBuffer(&bvbd, &bvsd, &g_boxVB);
+
+    D3D11_BUFFER_DESC bibd{};
+    bibd.ByteWidth = (UINT)(boxI.size() * sizeof(uint32_t));
+    bibd.Usage     = D3D11_USAGE_DEFAULT;
+    bibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA bisd{boxI.data()};
+    g_dev->CreateBuffer(&bibd, &bisd, &g_boxIB);
+
+    // --- No-cull rasterizer state (see inside of box) ---
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode        = D3D11_FILL_SOLID;
+    rd.CullMode        = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    g_dev->CreateRasterizerState(&rd, &g_noCullRS);
+
+    // --- Initialize 3000 balls in a grid, slightly above floor ---
+    g_balls.resize(NUM_BALLS);
+    float spacing = BALL_RADIUS * 2.1f;
+    int perRow = (int)((BOX_HALF * 2.0f - BALL_RADIUS * 2.0f) / spacing);
+    if (perRow < 1) perRow = 1;
+    XMFLOAT3 palette[] = {
+        {0.95f, 0.15f, 0.15f}, {0.15f, 0.85f, 0.15f}, {0.15f, 0.35f, 0.95f},
+        {0.95f, 0.85f, 0.10f}, {0.95f, 0.50f, 0.05f}, {0.70f, 0.15f, 0.90f},
+        {0.05f, 0.85f, 0.85f}, {0.95f, 0.30f, 0.60f},
+    };
+    std::uniform_int_distribution<int> colDist(0, 7);
+    int placed = 0;
+    for (int ly = 0; placed < NUM_BALLS; ly++) {
+        for (int lz = 0; lz < perRow && placed < NUM_BALLS; lz++) {
+            for (int lx = 0; lx < perRow && placed < NUM_BALLS; lx++) {
+                float x = -BOX_HALF + BALL_RADIUS + lx * spacing;
+                float y = BALL_RADIUS + ly * spacing;
+                float z = -BOX_HALF + BALL_RADIUS + lz * spacing;
+                g_balls[placed].pos = {x, y, z};
+                g_balls[placed].vel = {0, 0, 0};
+                g_balls[placed].radius = BALL_RADIUS;
+                g_balls[placed].color = palette[colDist(g_rng)];
+                placed++;
+            }
+        }
+    }
+
+    // Fill instance data
+    for (int i = 0; i < NUM_BALLS; i++) {
+        g_ballInstances[i] = {g_balls[i].pos, g_balls[i].radius, g_balls[i].color};
+    }
+
+    printf("[OK] Ball pit: %d spheres, %u tri/sphere, box %.0fx%.0fx%.0f\n",
+           NUM_BALLS, g_ballSphereNumIdx / 3, BOX_HALF*2, BOX_HEIGHT, BOX_HALF*2);
+
+    // --- Load ball physics NPU model ---
+    bool ballModelExists = GetFileAttributesA("ball_physics.onnx") != INVALID_FILE_ATTRIBUTES;
+    if (ballModelExists) {
+        try {
+            // Use same backend type as water model
+            bool useOV = g_backend && g_backend->name().find("OpenVINO") != std::string::npos;
+            if (useOV) {
+#ifdef HAS_OPENVINO
+                g_ballBackend = std::make_unique<OpenVinoBackend>("ball_physics.onnx", g_device);
+#endif
+            } else {
+#ifdef HAS_WINDOWSML
+                g_ballBackend = std::make_unique<WindowsMLBackend>("ball_physics.onnx", g_device);
+#endif
+            }
+            if (g_ballBackend)
+                printf("[OK] Ball physics NPU: %s\n", g_ballBackend->name().c_str());
+        } catch (const std::exception& e) {
+            printf("WARNING: Ball physics NPU init failed: %s\n", e.what());
+            g_ballBackend.reset();
+        }
+    } else {
+        printf("WARNING: ball_physics.onnx not found — run generate_ball_model.py\n");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Initialize inference backend (OpenVINO or ONNX Runtime + DirectML)
+// ---------------------------------------------------------------------------
+static void initBackend() {
     try {
-        ov::Core core;
+        bool useOV = false;
 
-        auto devices = core.get_available_devices();
-        printf("OpenVINO devices:\n");
-        bool deviceFound = false;
-        for (auto& d : devices) {
-            std::string caps;
-            try {
-                auto opt = core.get_property(d, ov::device::capabilities);
-                for (auto& c : opt) { if (!caps.empty()) caps += ", "; caps += c; }
-            } catch (...) {}
-            printf("  %-8s  [%s]\n", d.c_str(), caps.c_str());
-            if (d.find(g_device) != std::string::npos) deviceFound = true;
+        switch (g_runtimeChoice) {
+        case RuntimeChoice::OpenVINO:
+            useOV = true;
+            break;
+        case RuntimeChoice::WindowsML:
+            useOV = false;
+            break;
+        case RuntimeChoice::Auto: {
+#ifdef HAS_OPENVINO
+            // Check CPU vendor via CPUID — only try OpenVINO on Intel
+            int cpuInfo[4] = {};
+            __cpuid(cpuInfo, 0);
+            char vendor[13] = {};
+            memcpy(vendor, &cpuInfo[1], 4);
+            memcpy(vendor + 4, &cpuInfo[3], 4);
+            memcpy(vendor + 8, &cpuInfo[2], 4);
+            if (std::string(vendor) == "GenuineIntel") {
+                useOV = OpenVinoBackend::hasIntelNPU() || g_device == "CPU";
+            }
+#endif
+            break;
         }
-        if (!deviceFound) {
-            std::string msg = "Device '" + g_device + "' not found.\nAvailable: ";
-            for (auto& d : devices) msg += d + " ";
-            fail(msg.c_str());
         }
 
-        auto model = core.read_model("water_physics.onnx");
-        printf("Model loaded, compiling for %s ...\n", g_device.c_str());
-        auto compiled = core.compile_model(model, g_device);
-        g_infer = compiled.create_infer_request();
+        if (useOV) {
+#ifdef HAS_OPENVINO
+            g_backend = std::make_unique<OpenVinoBackend>("water_physics.onnx", g_device);
+#else
+            fail("OpenVINO support not compiled (HAS_OPENVINO not defined)");
+#endif
+        } else {
+#ifdef HAS_WINDOWSML
+            g_backend = std::make_unique<WindowsMLBackend>("water_physics.onnx", g_device);
+#else
+            fail("Windows ML support not compiled (HAS_WINDOWSML not defined)");
+#endif
+        }
 
-        g_state.resize(4 * GRID * GRID, ov::float16(0.0f));
-        g_wavePhase.resize(N_WAVES, ov::float16(0.0f));
-        g_renderBuf.resize(10 * GRID * GRID, ov::float16(0.0f));
+        // Set conversion functions based on backend precision
+        if (g_backend->isBf16()) {
+            f32_to_f16 = f32_to_bf16;
+            f16_to_f32 = bf16_to_f32;
+        } else {
+            f32_to_f16 = f32_to_fp16;
+            f16_to_f32 = fp16_to_f32;
+        }
+
+        g_state.resize(4 * GRID * GRID, uint16_t(0));
+        g_wavePhase.resize(N_WAVES, uint16_t(0));
+        g_renderBuf.resize(10 * GRID * GRID, uint16_t(0));
         resetState();
 
-        printf("Ocean engine ready on %s.\n", g_device.c_str());
-        printf("  Grid       : %dx%d FP16\n", GRID, GRID);
+        printf("Backend: %s\n", g_backend->name().c_str());
+        const char* precStr = g_backend->isBf16() ? "BF16" : (g_backend->isFp32Model() ? "FP32" : "FP16");
+        printf("  Grid       : %dx%d %s\n", GRID, GRID, precStr);
         printf("  Ocean      : 32 Gerstner waves (Phillips spectrum)\n");
         printf("  Ripples    : 8 substeps interactive wave equation\n");
-        printf("  1 inference call per frame -- all on %s\n\n", g_device.c_str());
+        printf("  1 inference call per frame\n\n");
 
-    } catch (const ov::Exception& e) {
-        std::string msg = "OpenVINO error:\n";
-        msg += e.what();
-        fail(msg.c_str());
     } catch (const std::exception& e) {
-        std::string msg = "OpenVINO initialization failed:\n";
+        std::string msg = "Backend initialization failed:\n";
         msg += e.what();
         fail(msg.c_str());
     } catch (...) {
-        fail("OpenVINO initialization failed with unknown exception.");
+        fail("Backend initialization failed with unknown exception.");
     }
 }
 
@@ -896,102 +1644,82 @@ static void initOpenVINO() {
 // Run full frame on NPU — 32 Gerstner waves + ripple physics + render
 // ---------------------------------------------------------------------------
 static void runSimulation() {
-    // Input 0: ripple state [1, 2, GRID, GRID] (h_cur, h_prev)
-    auto stateTensor = g_infer.get_input_tensor(0);
-    memcpy(stateTensor.data<ov::float16>(), g_state.data(),
-           g_state.size() * sizeof(ov::float16));
+    // Input 0: ripple state [1, 4, GRID, GRID]
+    memcpy(g_backend->getInput(0), g_state.data(), g_state.size() * sizeof(uint16_t));
 
-    // Input 1: wave phases [1, 32, 1, 1] — per-wave wrapped omega*time
-    auto waveTensor = g_infer.get_input_tensor(1);
-    memcpy(waveTensor.data<ov::float16>(), g_wavePhase.data(),
-           N_WAVES * sizeof(ov::float16));
+    // Input 1: wave phases [1, 32, 1, 1]
+    memcpy(g_backend->getInput(1), g_wavePhase.data(), N_WAVES * sizeof(uint16_t));
 
-    // Input 2: camera position [1, 3, 1, 1] — for view-dependent refraction
-    auto cameraTensor = g_infer.get_input_tensor(2);
-    auto* camData = cameraTensor.data<ov::float16>();
+    // Input 2: camera position [1, 3, 1, 1]
+    auto* camIn = g_backend->getInput(2);
     float camAngle = g_time * g_camSpeed + g_camAngle;
     float camDist  = GRID * g_camDist;
     float camH     = GRID * g_camHeight;
-    camData[0] = ov::float16(cosf(camAngle) * camDist);  // eye_x
-    camData[1] = ov::float16(camH);                       // eye_y
-    camData[2] = ov::float16(sinf(camAngle) * camDist);  // eye_z
+    camIn[0] = f32_to_f16(cosf(camAngle) * camDist);
+    camIn[1] = f32_to_f16(camH);
+    camIn[2] = f32_to_f16(sinf(camAngle) * camDist);
 
-    // Input 3: duck state [1, 7, 1, 1] = (x, z, vx, vz, y, tiltX, tiltZ)
-    auto duckTensor = g_infer.get_input_tensor(3);
-    auto* duckIn = duckTensor.data<ov::float16>();
-    duckIn[0] = ov::float16(g_duckX);
-    duckIn[1] = ov::float16(g_duckZ);
-    duckIn[2] = ov::float16(g_duckVX);
-    duckIn[3] = ov::float16(g_duckVZ);
-    duckIn[4] = ov::float16(g_duckY);
-    duckIn[5] = ov::float16(g_duckTiltX);
-    duckIn[6] = ov::float16(g_duckTiltZ);
+    // Input 3: duck state [1, 7, 1, 1]
+    auto* duckIn = g_backend->getInput(3);
+    duckIn[0] = f32_to_f16(g_duckX);
+    duckIn[1] = f32_to_f16(g_duckZ);
+    duckIn[2] = f32_to_f16(g_duckVX);
+    duckIn[3] = f32_to_f16(g_duckVZ);
+    duckIn[4] = f32_to_f16(g_duckY);
+    duckIn[5] = f32_to_f16(g_duckTiltX);
+    duckIn[6] = f32_to_f16(g_duckTiltZ);
 
-    // Input 4: delta time [1, 1, 1, 1] — for frame-rate independent physics
-    auto dtTensor = g_infer.get_input_tensor(4);
-    dtTensor.data<ov::float16>()[0] = ov::float16(g_dt);
+    // Input 4: delta time [1, 1, 1, 1]
+    g_backend->getInput(4)[0] = f32_to_f16(g_dt);
 
-    // Input 5: duck2 state [1, 7, 1, 1] = (x, z, vx, vz, y, tiltX, tiltZ)
-    auto duck2Tensor = g_infer.get_input_tensor(5);
-    auto* duck2In = duck2Tensor.data<ov::float16>();
-    duck2In[0] = ov::float16(g_duck2X);
-    duck2In[1] = ov::float16(g_duck2Z);
-    duck2In[2] = ov::float16(g_duck2VX);
-    duck2In[3] = ov::float16(g_duck2VZ);
-    duck2In[4] = ov::float16(g_duck2Y);
-    duck2In[5] = ov::float16(g_duck2TiltX);
-    duck2In[6] = ov::float16(g_duck2TiltZ);
+    // Input 5: duck2 state [1, 7, 1, 1]
+    auto* duck2In = g_backend->getInput(5);
+    duck2In[0] = f32_to_f16(g_duck2X);
+    duck2In[1] = f32_to_f16(g_duck2Z);
+    duck2In[2] = f32_to_f16(g_duck2VX);
+    duck2In[3] = f32_to_f16(g_duck2VZ);
+    duck2In[4] = f32_to_f16(g_duck2Y);
+    duck2In[5] = f32_to_f16(g_duck2TiltX);
+    duck2In[6] = f32_to_f16(g_duck2TiltZ);
 
-    // Input 6: splash [1, 4, 1, 1] = (x, z, radius, height) — height=0 when idle
-    auto splashTensor = g_infer.get_input_tensor(6);
-    auto* splashData = splashTensor.data<ov::float16>();
-    splashData[0] = ov::float16(g_splashX);
-    splashData[1] = ov::float16(g_splashZ);
-    splashData[2] = ov::float16(g_splashHeight > 0.0f ? g_splashRadius : 1.0f);
-    splashData[3] = ov::float16(g_splashHeight);
-    g_splashHeight = 0.0f;  // one-shot: clear after packing
+    // Input 6: splash [1, 4, 1, 1]
+    auto* splashIn = g_backend->getInput(6);
+    splashIn[0] = f32_to_f16(g_splashX);
+    splashIn[1] = f32_to_f16(g_splashZ);
+    splashIn[2] = f32_to_f16(g_splashHeight > 0.0f ? g_splashRadius : 1.0f);
+    splashIn[3] = f32_to_f16(g_splashHeight);
+    g_splashHeight = 0.0f;
 
-    // Input 7: foam params [1, 2, 1, 1] = (threshold, coarseness)
-    auto foamParamsTensor = g_infer.get_input_tensor(7);
-    auto* foamParamsData = foamParamsTensor.data<ov::float16>();
-    foamParamsData[0] = ov::float16(g_foamThreshold);
-    foamParamsData[1] = ov::float16(g_foamCoarseness);
-    foamParamsData[2] = ov::float16(g_foamEnabled ? g_foamDecay : 0.0f);
-    foamParamsData[3] = ov::float16(g_foamEnabled ? g_foamGeneration : 0.0f);
+    // Input 7: foam params [1, 4, 1, 1]
+    auto* foamIn = g_backend->getInput(7);
+    foamIn[0] = f32_to_f16(g_foamThreshold);
+    foamIn[1] = f32_to_f16(g_foamCoarseness);
+    foamIn[2] = f32_to_f16(g_foamEnabled ? g_foamDecay : 0.0f);
+    foamIn[3] = f32_to_f16(g_foamEnabled ? g_foamGeneration : 0.0f);
 
-    // Input 8: render params [1, 3, 1, 1] = (chopScale, heightScale, normalY)
-    auto renderParamsTensor = g_infer.get_input_tensor(8);
-    auto* renderParamsData = renderParamsTensor.data<ov::float16>();
-    renderParamsData[0] = ov::float16(g_chopScale);
-    renderParamsData[1] = ov::float16(g_heightScale);
-    renderParamsData[2] = ov::float16(g_normalY);
+    // Input 8: render params [1, 3, 1, 1]
+    auto* renderIn = g_backend->getInput(8);
+    renderIn[0] = f32_to_f16(g_chopScale);
+    renderIn[1] = f32_to_f16(g_heightScale);
+    renderIn[2] = f32_to_f16(g_normalY);
 
-    // Single inference: waves + ripples + caustics + refraction + duck + ball + splash
-    g_infer.infer();
+    // Single inference: all physics on NPU
+    g_backend->infer();
 
     // Output 0: new simulation state
-    auto stateOut = g_infer.get_output_tensor(0);
-    memcpy(g_state.data(), stateOut.data<ov::float16>(),
-           g_state.size() * sizeof(ov::float16));
+    memcpy(g_state.data(), g_backend->getOutput(0), g_state.size() * sizeof(uint16_t));
 
+    // Output 1: render data [1, 10, GRID, GRID]
+    memcpy(g_renderBuf.data(), g_backend->getOutput(1), g_renderBuf.size() * sizeof(uint16_t));
 
-    // Output 1: render data (h, dhdx, dhdz, caustic, refract_x, refract_z, foam)
-    auto renderOut = g_infer.get_output_tensor(1);
-    memcpy(g_renderBuf.data(), renderOut.data<ov::float16>(),
-           g_renderBuf.size() * sizeof(ov::float16));
-
-    // Output 2: duck1 state (x, z, vx, vz, y, tiltX, tiltZ)
-    auto duckOut = g_infer.get_output_tensor(2);
-    auto* duckResult = duckOut.data<ov::float16>();
+    // Output 2: duck1 state
+    auto* duckOut = g_backend->getOutput(2);
 
     // Output 3: duck2 state
-    auto duck2Out = g_infer.get_output_tensor(3);
-    auto* duck2Result = duck2Out.data<ov::float16>();
+    auto* duck2Out = g_backend->getOutput(3);
 
-    // Output 4: updated wave phases (NPU-maintained, wrapped [-π,π))
-    auto wavePhaseOut = g_infer.get_output_tensor(4);
-    memcpy(g_wavePhase.data(), wavePhaseOut.data<ov::float16>(),
-           N_WAVES * sizeof(ov::float16));
+    // Output 4: updated wave phases
+    memcpy(g_wavePhase.data(), g_backend->getOutput(4), N_WAVES * sizeof(uint16_t));
 
     // Duck1: if dragged, keep mouse position; otherwise take NPU output
     if (g_draggedDuck == 0) {
@@ -999,19 +1727,19 @@ static void runSimulation() {
         g_duckVZ    = (g_duckZ - g_duckPrevZ) / g_dt;
         g_duckPrevX = g_duckX;
         g_duckPrevZ = g_duckZ;
-        g_duckY     = float(duckResult[4]);
-        g_duckTiltX = float(duckResult[5]);
-        g_duckTiltZ = float(duckResult[6]);
+        g_duckY     = f16_to_f32(duckOut[4]);
+        g_duckTiltX = f16_to_f32(duckOut[5]);
+        g_duckTiltZ = f16_to_f32(duckOut[6]);
     } else {
         g_duckPrevX = g_duckX;
         g_duckPrevZ = g_duckZ;
-        g_duckX     = float(duckResult[0]);
-        g_duckZ     = float(duckResult[1]);
-        g_duckVX    = float(duckResult[2]);
-        g_duckVZ    = float(duckResult[3]);
-        g_duckY     = float(duckResult[4]);
-        g_duckTiltX = float(duckResult[5]);
-        g_duckTiltZ = float(duckResult[6]);
+        g_duckX     = f16_to_f32(duckOut[0]);
+        g_duckZ     = f16_to_f32(duckOut[1]);
+        g_duckVX    = f16_to_f32(duckOut[2]);
+        g_duckVZ    = f16_to_f32(duckOut[3]);
+        g_duckY     = f16_to_f32(duckOut[4]);
+        g_duckTiltX = f16_to_f32(duckOut[5]);
+        g_duckTiltZ = f16_to_f32(duckOut[6]);
     }
 
     // Duck2: same pattern
@@ -1020,21 +1748,20 @@ static void runSimulation() {
         g_duck2VZ    = (g_duck2Z - g_duck2PrevZ) / g_dt;
         g_duck2PrevX = g_duck2X;
         g_duck2PrevZ = g_duck2Z;
-        g_duck2Y     = float(duck2Result[4]);
-        g_duck2TiltX = float(duck2Result[5]);
-        g_duck2TiltZ = float(duck2Result[6]);
+        g_duck2Y     = f16_to_f32(duck2Out[4]);
+        g_duck2TiltX = f16_to_f32(duck2Out[5]);
+        g_duck2TiltZ = f16_to_f32(duck2Out[6]);
     } else {
         g_duck2PrevX = g_duck2X;
         g_duck2PrevZ = g_duck2Z;
-        g_duck2X     = float(duck2Result[0]);
-        g_duck2Z     = float(duck2Result[1]);
-        g_duck2VX    = float(duck2Result[2]);
-        g_duck2VZ    = float(duck2Result[3]);
-        g_duck2Y     = float(duck2Result[4]);
-        g_duck2TiltX = float(duck2Result[5]);
-        g_duck2TiltZ = float(duck2Result[6]);
+        g_duck2X     = f16_to_f32(duck2Out[0]);
+        g_duck2Z     = f16_to_f32(duck2Out[1]);
+        g_duck2VX    = f16_to_f32(duck2Out[2]);
+        g_duck2VZ    = f16_to_f32(duck2Out[3]);
+        g_duck2Y     = f16_to_f32(duck2Out[4]);
+        g_duck2TiltX = f16_to_f32(duck2Out[5]);
+        g_duck2TiltZ = f16_to_f32(duck2Out[6]);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,13 +1778,13 @@ static void updateMesh() {
     //   Channel 7-8: refract_x, refract_z
     //   Channel 9: foam density [0..1]
     for (int idx = 0; idx < NN; idx++) {
-        g_verts[idx].pos.x = float(g_renderBuf[0 * NN + idx]);
-        g_verts[idx].pos.y = float(g_renderBuf[1 * NN + idx]);
-        g_verts[idx].pos.z = float(g_renderBuf[2 * NN + idx]);
-        g_verts[idx].nrm.x = float(g_renderBuf[3 * NN + idx]);
-        g_verts[idx].nrm.y = float(g_renderBuf[4 * NN + idx]);
-        g_verts[idx].nrm.z = float(g_renderBuf[5 * NN + idx]);
-        g_verts[idx].foam  = g_foamEnabled ? float(g_renderBuf[9 * NN + idx]) : 0.0f;
+        g_verts[idx].pos.x = f16_to_f32(g_renderBuf[0 * NN + idx]);
+        g_verts[idx].pos.y = f16_to_f32(g_renderBuf[1 * NN + idx]);
+        g_verts[idx].pos.z = f16_to_f32(g_renderBuf[2 * NN + idx]);
+        g_verts[idx].nrm.x = f16_to_f32(g_renderBuf[3 * NN + idx]);
+        g_verts[idx].nrm.y = f16_to_f32(g_renderBuf[4 * NN + idx]);
+        g_verts[idx].nrm.z = f16_to_f32(g_renderBuf[5 * NN + idx]);
+        g_verts[idx].foam  = g_foamEnabled ? f16_to_f32(g_renderBuf[9 * NN + idx]) : 0.0f;
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1073,6 +1800,84 @@ static void updateMesh() {
 // Duck physics (collision, buoyancy, tilt, slope drift, wall bounce) all on NPU.
 // CPU only reads back duck_out = (x, z, vx, vz, y, tiltX, tiltZ) for rendering.
 static void updateDuck() {
+}
+
+// ---------------------------------------------------------------------------
+// Ball pit physics — all on NPU (gravity, walls, N² pairwise collision)
+// ---------------------------------------------------------------------------
+static bool  g_ballShootEnabled = true;
+static float g_ballShootTimer   = 0.0f;
+static int   g_ballShootNext    = 0;
+
+static void shootBall() {
+    int i = g_ballShootNext;
+    g_ballShootNext = (g_ballShootNext + 1) % NUM_BALLS;
+
+    // Random angle around the box edge
+    float angle = (float)(rand() % 360) * 3.14159f / 180.0f;
+    float edge = BOX_HALF - BALL_RADIUS;
+    g_balls[i].pos = { cosf(angle) * edge, BOX_HEIGHT * 0.8f, sinf(angle) * edge };
+
+    // Aim toward center with high speed
+    float speed = 400.0f;
+    XMFLOAT3 dir = { -g_balls[i].pos.x, -5.0f, -g_balls[i].pos.z };
+    float len = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    g_balls[i].vel = { dir.x/len * speed, dir.y/len * speed, dir.z/len * speed };
+}
+
+static void updateBalls() {
+    if (!g_ballBackend) return;
+
+    // Auto-shoot a ball every second
+    if (g_ballShootEnabled) {
+        g_ballShootTimer += 1.0f / 30.0f;
+        if (g_ballShootTimer >= 1.0f) {
+            g_ballShootTimer -= 1.0f;
+            for (int s = 0; s < 20; s++) shootBall();
+        }
+    }
+
+    // Pack positions into [1, 3, N, 1] — channel-first (x,y,z as channels)
+    auto* posIn = g_ballBackend->getInput(0);
+    auto* velIn = g_ballBackend->getInput(1);
+    for (int i = 0; i < NUM_BALLS; i++) {
+        posIn[0 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].pos.x);
+        posIn[1 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].pos.y);
+        posIn[2 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].pos.z);
+        velIn[0 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].vel.x);
+        velIn[1 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].vel.y);
+        velIn[2 * NUM_BALLS + i] = f32_to_fp16(g_balls[i].vel.z);
+    }
+
+    // dt [1,1,1,1]
+    g_ballBackend->getInput(2)[0] = f32_to_fp16(1.0f / 30.0f);
+
+    // grab_mask [1,1,N,1]: 1.0 = free, 0.0 = grabbed (NPU skips physics for grabbed ball)
+    auto* maskIn = g_ballBackend->getInput(3);
+    for (int i = 0; i < NUM_BALLS; i++)
+        maskIn[i] = f32_to_fp16(i == g_grabbedBall ? 0.0f : 1.0f);
+
+    // Single NPU call: gravity + walls + N² pairwise collision × 4 substeps
+    g_ballBackend->infer();
+
+    // Unpack results from [1, 3, N, 1]
+    auto* posOut = g_ballBackend->getOutput(0);
+    auto* velOut = g_ballBackend->getOutput(1);
+    for (int i = 0; i < NUM_BALLS; i++) {
+        g_balls[i].pos.x = fp16_to_f32(posOut[0 * NUM_BALLS + i]);
+        g_balls[i].pos.y = fp16_to_f32(posOut[1 * NUM_BALLS + i]);
+        g_balls[i].pos.z = fp16_to_f32(posOut[2 * NUM_BALLS + i]);
+        g_balls[i].vel.x = fp16_to_f32(velOut[0 * NUM_BALLS + i]);
+        g_balls[i].vel.y = fp16_to_f32(velOut[1 * NUM_BALLS + i]);
+        g_balls[i].vel.z = fp16_to_f32(velOut[2 * NUM_BALLS + i]);
+    }
+
+    // Update GPU instance data for rendering
+    for (int i = 0; i < NUM_BALLS; i++) {
+        g_ballInstances[i].pos = g_balls[i].pos;
+        g_ballInstances[i].radius = g_balls[i].radius;
+        g_ballInstances[i].color = g_balls[i].color;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,9 +1927,9 @@ static void render() {
     g_ctx->Map(g_causticTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     const int NN = GRID * GRID;
     auto* dst = reinterpret_cast<uint16_t*>(mapped.pData);
-    auto* causticSrc  = reinterpret_cast<const uint16_t*>(&g_renderBuf[6 * NN]);
-    auto* refractXSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[7 * NN]);
-    auto* refractZSrc = reinterpret_cast<const uint16_t*>(&g_renderBuf[8 * NN]);
+    auto* causticSrc  = &g_renderBuf[6 * NN];
+    auto* refractXSrc = &g_renderBuf[7 * NN];
+    auto* refractZSrc = &g_renderBuf[8 * NN];
     int dstPitch = mapped.RowPitch / 2;  // in uint16_t units
     for (int row = 0; row < GRID; row++) {
         for (int col = 0; col < GRID; col++) {
@@ -1220,6 +2025,62 @@ static void render() {
 }
 
 // ---------------------------------------------------------------------------
+// Render ball pit scene
+// ---------------------------------------------------------------------------
+static void renderBalls() {
+    float clearColor[] = {0.92f, 0.93f, 0.95f, 1.0f};
+    g_ctx->ClearRenderTargetView(g_rtv, clearColor);
+    g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+
+    float angle = g_ballCamAngle;
+    XMVECTOR target = XMVectorSet(0.0f, BOX_HEIGHT * 0.25f, 0.0f, 0.0f);
+    XMVECTOR eye = target + XMVectorSet(
+        cosf(angle) * g_ballCamDist, g_ballCamHeight - BOX_HEIGHT * 0.25f,
+        sinf(angle) * g_ballCamDist, 0.0f);
+    XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+
+    XMMATRIX view = XMMatrixLookAtLH(eye, target, up);
+    XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, float(WIN_W) / float(WIN_H), 0.1f, 500.0f);
+    XMMATRIX vp = view * proj;
+    g_lastVP = vp;
+
+    CB cb{};
+    XMFLOAT3 ld = {0.3f, 1.0f, 0.5f};
+    XMStoreFloat3(&cb.lightDir, XMVector3Normalize(XMLoadFloat3(&ld)));
+    XMStoreFloat3(&cb.eye, eye);
+    cb.time = g_time;
+    XMStoreFloat4x4(&cb.wvp, XMMatrixTranspose(vp));
+    XMStoreFloat4x4(&cb.world, XMMatrixTranspose(XMMatrixIdentity()));
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    g_ctx->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    memcpy(mapped.pData, &cb, sizeof(cb));
+    g_ctx->Unmap(g_cb, 0);
+
+    // --- Draw spheres (instanced) ---
+    g_ctx->Map(g_ballInstBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    memcpy(mapped.pData, g_ballInstances.data(), NUM_BALLS * sizeof(SphereInstance));
+    g_ctx->Unmap(g_ballInstBuf, 0);
+
+    g_ctx->RSSetState(g_rs);  // back-face cull is fine for convex spheres
+    g_ctx->IASetInputLayout(g_ballIL);
+    g_ctx->VSSetShader(g_ballVS, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
+    g_ctx->PSSetShader(g_ballPS, nullptr, 0);
+    g_ctx->PSSetConstantBuffers(0, 1, &g_cb);
+
+    UINT strides[2] = { sizeof(BallVertex), sizeof(SphereInstance) };
+    UINT offsets[2] = { 0, 0 };
+    ID3D11Buffer* vbs[2] = { g_ballSphereVB, g_ballInstBuf };
+    g_ctx->IASetVertexBuffers(0, 2, vbs, strides, offsets);
+    g_ctx->IASetIndexBuffer(g_ballSphereIB, DXGI_FORMAT_R32_UINT, 0);
+    g_ctx->DrawIndexedInstanced(g_ballSphereNumIdx, NUM_BALLS, 0, 0, 0);
+
+    g_sc->Present(1, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1231,12 +2092,22 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { g_running = false; PostQuitMessage(0); }
-        if (wp == VK_SPACE) {
-            g_splashX = 0.0f; g_splashZ = 0.0f;
-            g_splashRadius = 20.0f; g_splashHeight = 0.15f;
+        if (wp == 'B') {
+            g_scene = (g_scene == Scene::Water) ? Scene::Balls : Scene::Water;
+            g_draggedDuck = -1;
+            g_grabbedBall = -1;
         }
-        if (wp == 'R')       resetState();
-        if (wp == 'F')       g_foamEnabled = !g_foamEnabled;
+        if (g_scene == Scene::Water) {
+            if (wp == VK_SPACE) {
+                g_splashX = 0.0f; g_splashZ = 0.0f;
+                g_splashRadius = 20.0f; g_splashHeight = 0.15f;
+            }
+            if (wp == 'R') resetState();
+            if (wp == 'F') g_foamEnabled = !g_foamEnabled;
+        }
+        if (g_scene == Scene::Balls && wp == 'S') {
+            g_ballShootEnabled = !g_ballShootEnabled;
+        }
         if (wp == 'T' && g_panelHwnd) {
             g_showPanel = !g_showPanel;
             ShowWindow(g_panelHwnd, g_showPanel ? SW_SHOW : SW_HIDE);
@@ -1246,16 +2117,44 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         float mx = static_cast<float>(LOWORD(lp));
         float my = static_cast<float>(HIWORD(lp));
-        float wx, wz;
-        if (mouseToWaterPlane(mx, my, wx, wz)) {
-            float d1 = (wx - g_duckX) * (wx - g_duckX) + (wz - g_duckZ) * (wz - g_duckZ);
-            float d2 = (wx - g_duck2X) * (wx - g_duck2X) + (wz - g_duck2Z) * (wz - g_duck2Z);
-            float pickR = DUCK_SCALE * DUCK_SCALE;
-            if (d1 <= d2 && d1 < pickR) {
-                g_draggedDuck = 0;
-                SetCapture(hwnd);
-            } else if (d2 < pickR) {
-                g_draggedDuck = 1;
+        if (g_scene == Scene::Water) {
+            float wx, wz;
+            if (mouseToWaterPlane(mx, my, wx, wz)) {
+                float d1 = (wx - g_duckX) * (wx - g_duckX) + (wz - g_duckZ) * (wz - g_duckZ);
+                float d2 = (wx - g_duck2X) * (wx - g_duck2X) + (wz - g_duck2Z) * (wz - g_duck2Z);
+                float pickR = DUCK_SCALE * DUCK_SCALE;
+                if (d1 <= d2 && d1 < pickR) {
+                    g_draggedDuck = 0;
+                    SetCapture(hwnd);
+                } else if (d2 < pickR) {
+                    g_draggedDuck = 1;
+                    SetCapture(hwnd);
+                }
+            }
+        } else {
+            // Ball pit: ray-sphere picking
+            float ndcX = 2.0f * mx / WIN_W - 1.0f;
+            float ndcY = 1.0f - 2.0f * my / WIN_H;
+            XMMATRIX inv = XMMatrixInverse(nullptr, g_lastVP);
+            XMVECTOR nearPt = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 0.0f, 1.0f), inv);
+            XMVECTOR farPt  = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 1.0f, 1.0f), inv);
+            XMVECTOR rayDir = XMVector3Normalize(farPt - nearPt);
+            float bestT = 1e9f;
+            int bestIdx = -1;
+            for (int i = 0; i < NUM_BALLS; i++) {
+                XMVECTOR center = XMVectorSet(g_balls[i].pos.x, g_balls[i].pos.y, g_balls[i].pos.z, 0);
+                XMVECTOR oc = nearPt - center;
+                float a = XMVectorGetX(XMVector3Dot(rayDir, rayDir));
+                float b = 2.0f * XMVectorGetX(XMVector3Dot(oc, rayDir));
+                float c = XMVectorGetX(XMVector3Dot(oc, oc)) - g_balls[i].radius * g_balls[i].radius;
+                float disc = b * b - 4 * a * c;
+                if (disc < 0) continue;
+                float t = (-b - sqrtf(disc)) / (2 * a);
+                if (t > 0 && t < bestT) { bestT = t; bestIdx = i; }
+            }
+            if (bestIdx >= 0) {
+                g_grabbedBall = bestIdx;
+                g_grabY = g_balls[bestIdx].pos.y;
                 SetCapture(hwnd);
             }
         }
@@ -1265,49 +2164,95 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         float mx = static_cast<float>(LOWORD(lp));
         float my = static_cast<float>(HIWORD(lp));
-        if (g_rDragging) {
-            float dx = mx - g_rDragStartX;
-            g_camAngle = g_rDragStartAngle - dx * 0.01f;
-        }
-        if (g_draggedDuck >= 0) {
-            float wx, wz;
-            if (mouseToWaterPlane(mx, my, wx, wz)) {
-                float half = GRID * 0.5f - DUCK_SCALE * 0.5f;
-                wx = std::max(-half, std::min(half, wx));
-                wz = std::max(-half, std::min(half, wz));
-                if (g_draggedDuck == 0) { g_duckX = wx; g_duckZ = wz; }
-                else                    { g_duck2X = wx; g_duck2Z = wz; }
+        if (g_scene == Scene::Water) {
+            if (g_rDragging) {
+                float dx = mx - g_rDragStartX;
+                g_camAngle = g_rDragStartAngle - dx * 0.01f;
+            }
+            if (g_draggedDuck >= 0) {
+                float wx, wz;
+                if (mouseToWaterPlane(mx, my, wx, wz)) {
+                    float half = GRID * 0.5f - DUCK_SCALE * 0.5f;
+                    wx = std::max(-half, std::min(half, wx));
+                    wz = std::max(-half, std::min(half, wz));
+                    if (g_draggedDuck == 0) { g_duckX = wx; g_duckZ = wz; }
+                    else                    { g_duck2X = wx; g_duck2Z = wz; }
+                }
+            }
+        } else {
+            if (g_ballRDrag) {
+                float dx = mx - g_ballRDragStartX;
+                g_ballCamAngle = g_ballRDragStartAngle - dx * 0.01f;
+            }
+            if (g_grabbedBall >= 0) {
+                float wx, wz;
+                if (mouseToHorizPlane(mx, my, g_grabY, wx, wz)) {
+                    Ball& b = g_balls[g_grabbedBall];
+                    wx = std::max(-BOX_HALF + b.radius, std::min(BOX_HALF - b.radius, wx));
+                    wz = std::max(-BOX_HALF + b.radius, std::min(BOX_HALF - b.radius, wz));
+                    b.vel.x = (wx - b.pos.x) * 30.0f;
+                    b.vel.z = (wz - b.pos.z) * 30.0f;
+                    b.vel.y = 0;
+                    b.pos.x = wx;
+                    b.pos.z = wz;
+                }
             }
         }
         return 0;
     }
 
     case WM_LBUTTONUP:
-        if (g_draggedDuck >= 0) {
-            g_draggedDuck = -1;
-            if (!g_rDragging) ReleaseCapture();
+        if (g_scene == Scene::Water) {
+            if (g_draggedDuck >= 0) {
+                g_draggedDuck = -1;
+                if (!g_rDragging) ReleaseCapture();
+            }
+        } else {
+            if (g_grabbedBall >= 0) {
+                g_grabbedBall = -1;
+                if (!g_ballRDrag) ReleaseCapture();
+            }
         }
         return 0;
 
     case WM_RBUTTONDOWN: {
-        g_rDragging = true;
-        g_rDragStartX = static_cast<float>(LOWORD(lp));
-        g_rDragStartAngle = g_camAngle;
+        float rmx = static_cast<float>(LOWORD(lp));
+        if (g_scene == Scene::Water) {
+            g_rDragging = true;
+            g_rDragStartX = rmx;
+            g_rDragStartAngle = g_camAngle;
+        } else {
+            g_ballRDrag = true;
+            g_ballRDragStartX = rmx;
+            g_ballRDragStartAngle = g_ballCamAngle;
+        }
         SetCapture(hwnd);
         return 0;
     }
 
     case WM_RBUTTONUP:
-        if (g_rDragging) {
-            g_rDragging = false;
-            if (g_draggedDuck < 0) ReleaseCapture();
+        if (g_scene == Scene::Water) {
+            if (g_rDragging) {
+                g_rDragging = false;
+                if (g_draggedDuck < 0) ReleaseCapture();
+            }
+        } else {
+            if (g_ballRDrag) {
+                g_ballRDrag = false;
+                if (g_grabbedBall < 0) ReleaseCapture();
+            }
         }
         return 0;
 
     case WM_MOUSEWHEEL: {
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        g_camDist *= (delta > 0) ? 0.9f : 1.1f;
-        g_camDist = std::max(0.3f, std::min(2.0f, g_camDist));
+        if (g_scene == Scene::Water) {
+            g_camDist *= (delta > 0) ? 0.9f : 1.1f;
+            g_camDist = std::max(0.3f, std::min(2.0f, g_camDist));
+        } else {
+            g_ballCamDist *= (delta > 0) ? 0.9f : 1.1f;
+            g_ballCamDist = std::max(20.0f, std::min(200.0f, g_ballCamDist));
+        }
         return 0;
     }
     }
@@ -1318,18 +2263,35 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Entry point
 // ---------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    // Parse device: --device NPU|CPU (default: NPU)
+    // Parse flags: --device NPU|CPU (OpenVINO device)  --runtime auto|openvino|ort
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
             g_device = argv[++i];
             for (auto& c : g_device) c = static_cast<char>(toupper(c));
-            if (g_device == "GPU") {
-                printf("GPU device not supported — OpenVINO GPU plugin produces numerical\n"
-                       "instability in the chained ripple substeps. Use NPU or CPU instead.\n");
-                return 1;
-            }
+        }
+        if (strcmp(argv[i], "--runtime") == 0 && i + 1 < argc) {
+            std::string rt = argv[++i];
+            for (auto& c : rt) c = static_cast<char>(tolower(c));
+            if (rt == "openvino" || rt == "ov")    g_runtimeChoice = RuntimeChoice::OpenVINO;
+            else if (rt == "windowsml" || rt == "wml") g_runtimeChoice = RuntimeChoice::WindowsML;
+            else if (rt == "auto")                  g_runtimeChoice = RuntimeChoice::Auto;
+            else { printf("Unknown runtime: %s (use auto, openvino, or windowsml)\n", rt.c_str()); return 1; }
         }
     }
+    // GPU device only works through Windows ML (DirectML EP)
+    if (g_device == "GPU") {
+        if (g_runtimeChoice == RuntimeChoice::OpenVINO) {
+            printf("GPU not supported with OpenVINO — use --runtime windowsml\n");
+            return 1;
+        }
+        g_runtimeChoice = RuntimeChoice::WindowsML;
+    }
+    printf("=== NPU Bath ===\n");
+    printf("Controls:  Left-drag = grab duck/ball | Right-drag = rotate | Scroll = zoom | Space = splash | B = ball pit | R = reset | T = sliders | F = foam | Esc = quit\n\n");
+
+    initBackend();
+    printf("[OK] %s ready\n", g_backend->name().c_str());
+
     WNDCLASSW wc{};
     wc.lpfnWndProc  = wndProc;
     wc.hInstance     = GetModuleHandleW(nullptr);
@@ -1349,10 +2311,6 @@ int main(int argc, char* argv[]) {
 
     if (!g_hwnd) fail("CreateWindowW failed");
 
-    printf("=== Ocean Simulation [%s] ===\n", g_device.c_str());
-    printf("32 Gerstner waves + interactive ripples, all FP16 on %s\n", g_device.c_str());
-    printf("Controls:  Left-drag = grab duck | Right-drag = rotate | Scroll = zoom | Space = splash | R = reset | T = sliders | Esc = quit\n\n");
-
     initD3D();
     printf("[OK] D3D11 device created\n");
 
@@ -1362,8 +2320,7 @@ int main(int argc, char* argv[]) {
     initMesh();
     printf("[OK] Grid mesh: %d vertices, %u triangles\n", GRID * GRID, g_numIdx / 3);
 
-    initOpenVINO();
-    printf("[OK] %s ready\n", g_device.c_str());
+    initBallPit();
 
     createSliderPanel(wc.hInstance);
     printf("[OK] Slider panel created (press T to toggle)\n\n");
@@ -1391,28 +2348,58 @@ int main(int argc, char* argv[]) {
         // Fixed 30Hz tick — simulation + render
         simAccum += dt;
         fpsTimer += dt;
-        if (simAccum >= SIM_DT) {
+        if (simAccum < SIM_DT) {
+            Sleep(1);
+            continue;
+        }
+        {
             simAccum -= SIM_DT;
             g_time += SIM_DT;
-            if (g_time >= 50.0f) g_time -= 50.0f;  // for camera animation
-            updateDuck();
-            runSimulation();
-            updateMesh();
-            render();
+            if (g_time >= 50.0f) g_time -= 50.0f;
+
+            if (g_scene == Scene::Water) {
+                updateDuck();
+                runSimulation();
+                updateMesh();
+                render();
+            } else {
+                updateBalls();
+                renderBalls();
+            }
             frameCount++;
         }
 
         if (fpsTimer >= 1.0f) {
-            char title[128];
-            snprintf(title, sizeof(title),
-                     "NPU Bath | %s | %d FPS | %dx%d FP16",
-                     g_device.c_str(), frameCount, GRID, GRID);
+            char title[256];
+            if (g_scene == Scene::Water) {
+                const char* prec = g_backend->isBf16() ? "BF16" : (g_backend->isFp32Model() ? "FP32" : "FP16");
+                snprintf(title, sizeof(title),
+                         "NPU Bath | %s | %d FPS | %dx%d %s",
+                         g_backend->name().c_str(), frameCount, GRID, GRID, prec);
+            } else {
+                snprintf(title, sizeof(title),
+                         "Ball Pit | %d balls | %d FPS | B = water",
+                         NUM_BALLS, frameCount);
+            }
             SetWindowTextA(g_hwnd, title);
             frameCount = 0;
             fpsTimer -= 1.0f;
         }
     }
 
+    // Ball pit cleanup
+    if (g_noCullRS)     g_noCullRS->Release();
+    if (g_boxIB)        g_boxIB->Release();
+    if (g_boxVB)        g_boxVB->Release();
+    if (g_boxPS)        g_boxPS->Release();
+    if (g_ballPS)       g_ballPS->Release();
+    if (g_ballIL)       g_ballIL->Release();
+    if (g_ballVS)       g_ballVS->Release();
+    if (g_ballInstBuf)  g_ballInstBuf->Release();
+    if (g_ballSphereIB) g_ballSphereIB->Release();
+    if (g_ballSphereVB) g_ballSphereVB->Release();
+
+    // Water scene cleanup
     if (g_sampler)    g_sampler->Release();
     if (g_causticSRV) g_causticSRV->Release();
     if (g_causticTex) g_causticTex->Release();

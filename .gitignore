@@ -3,12 +3,21 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/main/VisualStudio.gitignore
 
+# Generated C++/WinRT projections
+generated/
+
 # Project-specific
 openvino_rt/
 openvino_2025.zip
 bin/
 obj/
 water_physics.onnx
+ball_physics.onnx
+water_physics_bf16.onnx
+water_physics_fp32.onnx
+ocean_sim.onnx
+demo.mp4
+packages.config
 *.stl
 *.jpg
 .claude/

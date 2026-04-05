@@ -19,6 +19,12 @@ import numpy as np
 import onnx
 from onnx import helper, TensorProto, numpy_helper
 
+try:
+    import ml_dtypes
+    _has_ml_dtypes = True
+except ImportError:
+    _has_ml_dtypes = False
+
 GRID = 256
 
 # --- Gerstner ocean ---
@@ -121,7 +127,32 @@ def generate_waves():
     return waves
 
 
-def create_model(output_path: str):
+def _make_initializer(arr, name, precision):
+    """Create an ONNX TensorProto initializer in the target precision."""
+    if arr.dtype == np.int64 or arr.dtype == np.int32:
+        return numpy_helper.from_array(arr, name)
+    if precision == "bf16":
+        # Convert to bfloat16 via ml_dtypes and store as raw bytes
+        bf = arr.astype(np.float32).astype(ml_dtypes.bfloat16)
+        return helper.make_tensor(name, TensorProto.BFLOAT16, list(bf.shape), bf.tobytes(), raw=True)
+    elif precision == "fp32":
+        return numpy_helper.from_array(arr.astype(np.float32), name)
+    else:
+        return numpy_helper.from_array(arr, name)
+
+
+def create_model(output_path: str, precision: str = "fp16"):
+    """Generate the ONNX model. precision: 'fp16' or 'bf16'."""
+    assert precision in ("fp16", "bf16", "fp32"), f"Unknown precision: {precision}"
+    if precision == "bf16" and not _has_ml_dtypes:
+        print("ERROR: ml_dtypes package required for bf16. Install with: pip install ml_dtypes")
+        sys.exit(1)
+    if precision == "bf16":
+        onnx_dtype = TensorProto.BFLOAT16
+    elif precision == "fp32":
+        onnx_dtype = TensorProto.FLOAT
+    else:
+        onnx_dtype = TensorProto.FLOAT16
     N = GRID
     P = [1, 1, 1, 1]
 
@@ -199,8 +230,8 @@ def create_model(output_path: str):
     z_grid = np.tile(coords.reshape(1, 1, N, 1), (1, 1, 1, N)).astype(np.float16)
 
     # Clamp sec(theta) to prevent extreme distortion at horizon
-    sec_clip_min = np.array([1.0], dtype=np.float16)
-    sec_clip_max = np.array([3.0], dtype=np.float16)
+    sec_clip_min = np.array(1.0, dtype=np.float16)
+    sec_clip_max = np.array(3.0, dtype=np.float16)
 
     # --- Duck hull displacement + wake (NPU, full NxN tensor ops) ---
     DUCK_R = 45.0 * 0.4   # waterline footprint radius (DUCK_SCALE * 0.4)
@@ -213,14 +244,14 @@ def create_model(output_path: str):
     # At 30fps: 0.92 = exp(-rate * 0.033) → rate = -ln(0.92)/0.033 ≈ 2.53
     duck_decay_rate = np.array([[[[math.log(0.92) / 0.033]]]], dtype=np.float16)  # negative → exp(neg*dt) < 1
     duck_pos_limit = N * 0.5 - DUCK_R
-    duck_pos_min = np.array([-duck_pos_limit], dtype=np.float16)
-    duck_pos_max = np.array([duck_pos_limit], dtype=np.float16)
+    duck_pos_min = np.array(-duck_pos_limit, dtype=np.float16)
+    duck_pos_max = np.array(duck_pos_limit, dtype=np.float16)
     hull_sigma = DUCK_R * 0.35  # tighter Gaussian — falls off faster
     hull_neg_inv_2s2 = np.array([[[[-1.0 / (2.0 * hull_sigma ** 2)]]]], dtype=np.float16)
     hull_depth = np.array([[[[-0.015]]]], dtype=np.float16)  # depression per second (scaled by dt)
     hull_cutoff_thresh = np.array([[[[0.01]]]], dtype=np.float16)  # kill Gaussian tail
-    hull_clip_zero = np.array([0.0], dtype=np.float16)
-    hull_clip_one  = np.array([1.0], dtype=np.float16)
+    hull_clip_zero = np.array(0.0, dtype=np.float16)
+    hull_clip_one  = np.array(1.0, dtype=np.float16)
     wake_epsilon2 = np.array([[[[1e-4]]]], dtype=np.float16)  # safe division
     wake_duckR = np.array([[[[DUCK_R]]]], dtype=np.float16)
     wake_ring_peak = np.array([[[[0.8]]]], dtype=np.float16)
@@ -240,7 +271,8 @@ def create_model(output_path: str):
 
     # Duck-duck collision constants
     DUCK_SCALE = 45.0
-    col_min_dist = np.array([[[[DUCK_SCALE]]]], dtype=np.float16)  # two duck half-sizes
+    col_min_dist = np.array([[[[DUCK_SCALE]]]], dtype=np.float16)  # two duck half-sizes (4D for Sub)
+    col_min_dist_scalar = np.array(DUCK_SCALE, dtype=np.float16)  # scalar for Clip
     col_pos_push = np.array([[[[0.5]]]], dtype=np.float16)   # position separation
     col_vel_push = np.array([[[[8.0]]]], dtype=np.float16)   # velocity impulse
 
@@ -252,19 +284,19 @@ def create_model(output_path: str):
     tilt_retain = np.array([[[[0.7]]]], dtype=np.float16)
 
     # Ripple amplitude clamp — prevents blowup on FP32 devices (CPU)
-    ripple_clip_min = np.array([-10.0], dtype=np.float16)
-    ripple_clip_max = np.array([10.0], dtype=np.float16)
+    ripple_clip_min = np.array(-10.0, dtype=np.float16)
+    ripple_clip_max = np.array(10.0, dtype=np.float16)
 
     # --- Foam layer constants ---
     foam_generation = np.array([[[[FOAM_GENERATION]]]], dtype=np.float16)
     foam_decay = np.array([[[[FOAM_DECAY]]]], dtype=np.float16)
     foam_destroy_rate = np.array([[[[FOAM_DESTROY_RATE]]]], dtype=np.float16)
-    foam_min_survive = np.array([[[[FOAM_MIN_SURVIVE]]]], dtype=np.float16)
+    foam_min_survive = np.array(FOAM_MIN_SURVIVE, dtype=np.float16)
     foam_duck_scale = np.array([[[[FOAM_DUCK_SCALE]]]], dtype=np.float16)
-    foam_emit_cap = np.array([FOAM_EMIT_CAP], dtype=np.float16)
+    foam_emit_cap = np.array(FOAM_EMIT_CAP, dtype=np.float16)
     foam_crest_thresh = np.array([[[[FOAM_CREST_THRESH]]]], dtype=np.float16)
     foam_crest_scale = np.array([[[[FOAM_CREST_SCALE]]]], dtype=np.float16)
-    foam_max = np.array([FOAM_MAX], dtype=np.float16)
+    foam_max = np.array(FOAM_MAX, dtype=np.float16)
     foam_advect_speed = np.array([[[[FOAM_ADVECT_SPEED / FOAM_ADVECT_STEPS]]]], dtype=np.float16)
     foam_height = np.array([[[[FOAM_HEIGHT]]]], dtype=np.float16)
     foam_duck_push = np.array([[[[FOAM_DUCK_PUSH]]]], dtype=np.float16)
@@ -285,75 +317,76 @@ def create_model(output_path: str):
     splash_neg4 = np.array([[[[-4.0]]]], dtype=np.float16)
 
     initializers = [
-        numpy_helper.from_array(ripple_k, "ripple_kernel"),
-        numpy_helper.from_array(ddx_w,    "ddx_w"),
-        numpy_helper.from_array(ddy_w,    "ddy_w"),
-        numpy_helper.from_array(damping,  "damping"),
-        numpy_helper.from_array(sponge,   "sponge_mask"),
-        numpy_helper.from_array(h_scale,  "h_scale"),
-        numpy_helper.from_array(blur_w,   "blur_w"),
-        numpy_helper.from_array(lap_w,    "lap_w"),
-        numpy_helper.from_array(caustic_scale, "caustic_scale"),
-        numpy_helper.from_array(refract_scale, "refract_scale"),
-        numpy_helper.from_array(x_grid,   "x_grid"),
-        numpy_helper.from_array(z_grid,   "z_grid"),
-        numpy_helper.from_array(sec_clip_min, "sec_clip_min"),
-        numpy_helper.from_array(sec_clip_max, "sec_clip_max"),
-        numpy_helper.from_array(duck_force, "duck_force"),
-        numpy_helper.from_array(duck_decay_rate, "duck_decay_rate"),
-        numpy_helper.from_array(duck_pos_min, "duck_pos_min"),
-        numpy_helper.from_array(duck_pos_max, "duck_pos_max"),
-        numpy_helper.from_array(np.array([1, 1], dtype=np.int64), "split2"),
-        numpy_helper.from_array(np.array([1, 1, 1], dtype=np.int64), "split3"),
-        numpy_helper.from_array(np.array([1, 1, N, N], dtype=np.int64), "grid_shape"),
-        numpy_helper.from_array(np.array([1, 1, 1, 1], dtype=np.int64), "split4"),
-        numpy_helper.from_array(np.array([1, 1, 1, 1, 1, 1], dtype=np.int64), "split6"),
-        numpy_helper.from_array(np.array([1, 1, 1, 1, 1, 1, 1], dtype=np.int64), "split7"),
-        numpy_helper.from_array(hull_neg_inv_2s2, "hull_neg_inv_2s2"),
-        numpy_helper.from_array(hull_depth, "hull_depth"),
-        numpy_helper.from_array(hull_cutoff_thresh, "hull_cutoff_thresh"),
-        numpy_helper.from_array(hull_clip_zero, "hull_clip_zero"),
-        numpy_helper.from_array(hull_clip_one, "hull_clip_one"),
-        numpy_helper.from_array(wake_epsilon2, "wake_epsilon2"),
-        numpy_helper.from_array(wake_duckR, "wake_duckR"),
-        numpy_helper.from_array(wake_ring_peak, "wake_ring_peak"),
-        numpy_helper.from_array(wake_neg_inv_rw, "wake_neg_inv_rw"),
-        numpy_helper.from_array(wake_strength, "wake_strength"),
-        numpy_helper.from_array(bow_sigma2, "bow_sigma2"),
-        numpy_helper.from_array(bow_strength, "bow_strength"),
-        numpy_helper.from_array(bow_offset_scale, "bow_offset_scale"),
-        numpy_helper.from_array(sample_neg_inv_s2, "sample_neg_inv_s2"),
-        numpy_helper.from_array(slope_prescale, "slope_prescale"),
-        numpy_helper.from_array(bounce_1p5, "bounce_1p5"),
-        numpy_helper.from_array(ripple_clip_min, "ripple_clip_min"),
-        numpy_helper.from_array(ripple_clip_max, "ripple_clip_max"),
-        numpy_helper.from_array(splash_neg4, "splash_neg4"),
-        numpy_helper.from_array(col_min_dist, "col_min_dist"),
-        numpy_helper.from_array(col_pos_push, "col_pos_push"),
-        numpy_helper.from_array(col_vel_push, "col_vel_push"),
-        numpy_helper.from_array(duck_y_offset, "duck_y_offset"),
-        numpy_helper.from_array(bob_smooth, "bob_smooth"),
-        numpy_helper.from_array(bob_retain, "bob_retain"),
-        numpy_helper.from_array(tilt_smooth, "tilt_smooth"),
-        numpy_helper.from_array(tilt_retain, "tilt_retain"),
-        numpy_helper.from_array(foam_generation, "foam_generation"),
-        numpy_helper.from_array(foam_decay, "foam_decay"),
-        numpy_helper.from_array(foam_destroy_rate, "foam_destroy_rate"),
-        numpy_helper.from_array(foam_min_survive, "foam_min_survive"),
-        numpy_helper.from_array(foam_duck_scale, "foam_duck_scale"),
-        numpy_helper.from_array(foam_emit_cap, "foam_emit_cap"),
-        numpy_helper.from_array(foam_crest_thresh, "foam_crest_thresh"),
-        numpy_helper.from_array(foam_crest_scale, "foam_crest_scale"),
-        numpy_helper.from_array(foam_max, "foam_max"),
-        numpy_helper.from_array(foam_advect_speed, "foam_advect_speed"),
-        numpy_helper.from_array(foam_height, "foam_height"),
-        numpy_helper.from_array(spl_border, "spl_border_mask"),
-        numpy_helper.from_array(foam_duck_push, "foam_duck_push"),
-        numpy_helper.from_array(foam_particle_sharp, "foam_particle_sharp"),
-        numpy_helper.from_array(foam_bubble_enhance, "foam_bubble_enhance"),
-        numpy_helper.from_array(foam_ripple_break, "foam_ripple_break"),
-        numpy_helper.from_array(foam_peak_grip, "foam_peak_grip"),
-        numpy_helper.from_array(foam_grip_scale, "foam_grip_scale"),
+        _make_initializer(ripple_k, "ripple_kernel", precision),
+        _make_initializer(ddx_w,    "ddx_w", precision),
+        _make_initializer(ddy_w,    "ddy_w", precision),
+        _make_initializer(damping,  "damping", precision),
+        _make_initializer(sponge,   "sponge_mask", precision),
+        _make_initializer(h_scale,  "h_scale", precision),
+        _make_initializer(blur_w,   "blur_w", precision),
+        _make_initializer(lap_w,    "lap_w", precision),
+        _make_initializer(caustic_scale, "caustic_scale", precision),
+        _make_initializer(refract_scale, "refract_scale", precision),
+        _make_initializer(x_grid,   "x_grid", precision),
+        _make_initializer(z_grid,   "z_grid", precision),
+        _make_initializer(sec_clip_min, "sec_clip_min", precision),
+        _make_initializer(sec_clip_max, "sec_clip_max", precision),
+        _make_initializer(duck_force, "duck_force", precision),
+        _make_initializer(duck_decay_rate, "duck_decay_rate", precision),
+        _make_initializer(duck_pos_min, "duck_pos_min", precision),
+        _make_initializer(duck_pos_max, "duck_pos_max", precision),
+        _make_initializer(np.array([1, 1], dtype=np.int64), "split2", precision),
+        _make_initializer(np.array([1, 1, 1], dtype=np.int64), "split3", precision),
+        _make_initializer(np.array([1, 1, N, N], dtype=np.int64), "grid_shape", precision),
+        _make_initializer(np.array([1, 1, 1, 1], dtype=np.int64), "split4", precision),
+        _make_initializer(np.array([1, 1, 1, 1, 1, 1], dtype=np.int64), "split6", precision),
+        _make_initializer(np.array([1, 1, 1, 1, 1, 1, 1], dtype=np.int64), "split7", precision),
+        _make_initializer(hull_neg_inv_2s2, "hull_neg_inv_2s2", precision),
+        _make_initializer(hull_depth, "hull_depth", precision),
+        _make_initializer(hull_cutoff_thresh, "hull_cutoff_thresh", precision),
+        _make_initializer(hull_clip_zero, "hull_clip_zero", precision),
+        _make_initializer(hull_clip_one, "hull_clip_one", precision),
+        _make_initializer(wake_epsilon2, "wake_epsilon2", precision),
+        _make_initializer(wake_duckR, "wake_duckR", precision),
+        _make_initializer(wake_ring_peak, "wake_ring_peak", precision),
+        _make_initializer(wake_neg_inv_rw, "wake_neg_inv_rw", precision),
+        _make_initializer(wake_strength, "wake_strength", precision),
+        _make_initializer(bow_sigma2, "bow_sigma2", precision),
+        _make_initializer(bow_strength, "bow_strength", precision),
+        _make_initializer(bow_offset_scale, "bow_offset_scale", precision),
+        _make_initializer(sample_neg_inv_s2, "sample_neg_inv_s2", precision),
+        _make_initializer(slope_prescale, "slope_prescale", precision),
+        _make_initializer(bounce_1p5, "bounce_1p5", precision),
+        _make_initializer(ripple_clip_min, "ripple_clip_min", precision),
+        _make_initializer(ripple_clip_max, "ripple_clip_max", precision),
+        _make_initializer(splash_neg4, "splash_neg4", precision),
+        _make_initializer(col_min_dist, "col_min_dist", precision),
+        _make_initializer(col_min_dist_scalar, "col_min_dist_scalar", precision),
+        _make_initializer(col_pos_push, "col_pos_push", precision),
+        _make_initializer(col_vel_push, "col_vel_push", precision),
+        _make_initializer(duck_y_offset, "duck_y_offset", precision),
+        _make_initializer(bob_smooth, "bob_smooth", precision),
+        _make_initializer(bob_retain, "bob_retain", precision),
+        _make_initializer(tilt_smooth, "tilt_smooth", precision),
+        _make_initializer(tilt_retain, "tilt_retain", precision),
+        _make_initializer(foam_generation, "foam_generation", precision),
+        _make_initializer(foam_decay, "foam_decay", precision),
+        _make_initializer(foam_destroy_rate, "foam_destroy_rate", precision),
+        _make_initializer(foam_min_survive, "foam_min_survive", precision),
+        _make_initializer(foam_duck_scale, "foam_duck_scale", precision),
+        _make_initializer(foam_emit_cap, "foam_emit_cap", precision),
+        _make_initializer(foam_crest_thresh, "foam_crest_thresh", precision),
+        _make_initializer(foam_crest_scale, "foam_crest_scale", precision),
+        _make_initializer(foam_max, "foam_max", precision),
+        _make_initializer(foam_advect_speed, "foam_advect_speed", precision),
+        _make_initializer(foam_height, "foam_height", precision),
+        _make_initializer(spl_border, "spl_border_mask", precision),
+        _make_initializer(foam_duck_push, "foam_duck_push", precision),
+        _make_initializer(foam_particle_sharp, "foam_particle_sharp", precision),
+        _make_initializer(foam_bubble_enhance, "foam_bubble_enhance", precision),
+        _make_initializer(foam_ripple_break, "foam_ripple_break", precision),
+        _make_initializer(foam_peak_grip, "foam_peak_grip", precision),
+        _make_initializer(foam_grip_scale, "foam_grip_scale", precision),
     ]
 
     # Precompute per-wave constants — packed into batch tensors
@@ -382,35 +415,35 @@ def create_model(output_path: str):
     wrap_scale = np.array([[[[10000.0]]]], dtype=np.float16)
 
     initializers.extend([
-        numpy_helper.from_array(all_phase_grids, "all_phase_grids"),
-        numpy_helper.from_array(omega_all, "omega_all"),
-        numpy_helper.from_array(amp_kernel, "amp_kernel"),
-        numpy_helper.from_array(pi_val, "pi_val"),
-        numpy_helper.from_array(two_pi_val, "two_pi_val"),
-        numpy_helper.from_array(wrap_scale, "wrap_scale"),
+        _make_initializer(all_phase_grids, "all_phase_grids", precision),
+        _make_initializer(omega_all, "omega_all", precision),
+        _make_initializer(amp_kernel, "amp_kernel", precision),
+        _make_initializer(pi_val, "pi_val", precision),
+        _make_initializer(two_pi_val, "two_pi_val", precision),
+        _make_initializer(wrap_scale, "wrap_scale", precision),
     ])
 
     # ----------------------------------------------------------------
     # Graph
     # ----------------------------------------------------------------
     state_in = helper.make_tensor_value_info(
-        "state", TensorProto.FLOAT16, [1, 4, N, N])
+        "state", onnx_dtype, [1, 4, N, N])
     wave_phase_in = helper.make_tensor_value_info(
-        "wave_phase", TensorProto.FLOAT16, [1, N_WAVES, 1, 1])
+        "wave_phase", onnx_dtype, [1, N_WAVES, 1, 1])
     camera_in = helper.make_tensor_value_info(
-        "camera", TensorProto.FLOAT16, [1, 3, 1, 1])
+        "camera", onnx_dtype, [1, 3, 1, 1])
     duck_in = helper.make_tensor_value_info(
-        "duck_in", TensorProto.FLOAT16, [1, 7, 1, 1])
+        "duck_in", onnx_dtype, [1, 7, 1, 1])
     dt_in = helper.make_tensor_value_info(
-        "dt", TensorProto.FLOAT16, [1, 1, 1, 1])
+        "dt", onnx_dtype, [1, 1, 1, 1])
     duck2_in = helper.make_tensor_value_info(
-        "duck2_in", TensorProto.FLOAT16, [1, 7, 1, 1])
+        "duck2_in", onnx_dtype, [1, 7, 1, 1])
     splash_in = helper.make_tensor_value_info(
-        "splash_in", TensorProto.FLOAT16, [1, 4, 1, 1])
+        "splash_in", onnx_dtype, [1, 4, 1, 1])
     foam_params_in = helper.make_tensor_value_info(
-        "foam_params", TensorProto.FLOAT16, [1, 4, 1, 1])
+        "foam_params", onnx_dtype, [1, 4, 1, 1])
     render_params_in = helper.make_tensor_value_info(
-        "render_params", TensorProto.FLOAT16, [1, 3, 1, 1])
+        "render_params", onnx_dtype, [1, 3, 1, 1])
 
     nodes = []
 
@@ -720,7 +753,7 @@ def create_model(output_path: str):
     nodes.append(helper.make_node("Sqrt", ["col_dist2s"], ["col_dist"]))
     # overlap = max(0, minDist - dist)
     nodes.append(helper.make_node("Sub", ["col_min_dist", "col_dist"], ["col_overlap_raw"]))
-    nodes.append(helper.make_node("Clip", ["col_overlap_raw", "hull_clip_zero", "col_min_dist"], ["col_overlap"]))
+    nodes.append(helper.make_node("Clip", ["col_overlap_raw", "hull_clip_zero", "col_min_dist_scalar"], ["col_overlap"]))
     # Push direction (duck1→duck2 normalized)
     nodes.append(helper.make_node("Div", ["col_dx", "col_dist"], ["col_nx"]))
     nodes.append(helper.make_node("Div", ["col_dz", "col_dist"], ["col_nz"]))
@@ -1042,15 +1075,15 @@ def create_model(output_path: str):
     # Build model
     # ----------------------------------------------------------------
     state_out = helper.make_tensor_value_info(
-        "new_state", TensorProto.FLOAT16, [1, 4, N, N])
+        "new_state", onnx_dtype, [1, 4, N, N])
     render_out = helper.make_tensor_value_info(
-        "render_out", TensorProto.FLOAT16, [1, 10, N, N])
+        "render_out", onnx_dtype, [1, 10, N, N])
     duck_out = helper.make_tensor_value_info(
-        "duck_out", TensorProto.FLOAT16, [1, 7, 1, 1])
+        "duck_out", onnx_dtype, [1, 7, 1, 1])
     duck2_out_info = helper.make_tensor_value_info(
-        "duck2_out", TensorProto.FLOAT16, [1, 7, 1, 1])
+        "duck2_out", onnx_dtype, [1, 7, 1, 1])
     wave_phase_out_info = helper.make_tensor_value_info(
-        "wave_phase_out", TensorProto.FLOAT16, [1, N_WAVES, 1, 1])
+        "wave_phase_out", onnx_dtype, [1, N_WAVES, 1, 1])
 
     graph = helper.make_graph(
         nodes, "ocean_npu",
@@ -1069,7 +1102,7 @@ def create_model(output_path: str):
     amp_min = min(w[4] for w in waves)
     amp_max = max(w[4] for w in waves)
     print(f"\nSaved: {output_path}")
-    print(f"  Grid          : {N}x{N} FP16")
+    print(f"  Grid          : {N}x{N} {precision.upper()}")
     print(f"  Ocean         : {len(waves)} Gerstner waves (Phillips spectrum, batch)")
     print(f"  Amp range     : {amp_min:.4f} .. {amp_max:.4f} (ratio {amp_max/amp_min:.1f}:1)")
     print(f"  Phase tracking: incremental omega*dt, wrapped [-pi,pi) (FP16-safe)")
@@ -1083,5 +1116,6 @@ def create_model(output_path: str):
 
 
 if __name__ == "__main__":
-    out = sys.argv[1] if len(sys.argv) > 1 else "water_physics.onnx"
-    create_model(out)
+    create_model("water_physics.onnx", "fp16")
+    print()
+    create_model("water_physics_fp32.onnx", "fp32")
